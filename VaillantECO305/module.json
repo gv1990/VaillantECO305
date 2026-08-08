@@ -1,0 +1,18 @@
+{
+  "id": "{678970D9-49EB-447B-A1AD-B9E83655F76C}",
+  "name": "VaillantECO305",
+  "type": 3,
+  "vendor": "Vaillant / ESERA",
+  "aliases": [
+    "Vaillant aroTHERM via ECO305"
+  ],
+  "url": "",
+  "parentRequirements": [
+    "{79827379-F36E-4ADA-8A95-5F8D1DC92FA9}"
+  ],
+  "childRequirements": [],
+  "implemented": [
+    "{018EF6B5-AB94-40C6-AA53-46943E824ACF}"
+  ],
+  "prefix": "VECO"
+}
