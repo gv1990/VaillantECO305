@@ -54,6 +54,11 @@ class VaillantECO305 extends IPSModuleStrict
         $this->RegisterVariableInteger('DiagB51ACount', 'Diagnose: B5-1A Telegramme gesehen', '', 910);
         $this->RegisterVariableString('DiagLastB51AHex', 'Diagnose: Letztes B5-1A Telegramm', '', 920);
         $this->RegisterVariableString('DiagB51ATypes', 'Diagnose: B5-1A Requesttypen', '', 930);
+        $this->RegisterVariableString('DiagB51A32', 'Diagnose: B5-1A 32 letzte Antwort', '', 940);
+        $this->RegisterVariableString('DiagB51A33', 'Diagnose: B5-1A 33 letzte Antwort', '', 950);
+        $this->RegisterVariableString('DiagB51A34', 'Diagnose: B5-1A 34 letzte Antwort', '', 960);
+        $this->RegisterVariableString('DiagB51A35', 'Diagnose: B5-1A 35 letzte Antwort', '', 970);
+        $this->RegisterVariableString('DiagB51A36', 'Diagnose: B5-1A 36 letzte Antwort', '', 980);
         $this->RegisterAttributeString('DiagB51ATypesJSON', '{}');
     }
 
@@ -193,6 +198,7 @@ class VaillantECO305 extends IPSModuleStrict
                 $this->IncrementDiagnostic('DiagB51ACount');
                 $this->SetValue('DiagLastB51AHex', $this->BytesToHex($telegram));
                 $this->UpdateB51ATypeDiagnostic($telegram, $p);
+                $this->UpdateB51AControlLoopDiagnostic($telegram, $p);
                 $this->ProcessB51A($telegram, $p);
             }
         }
@@ -260,6 +266,49 @@ class VaillantECO305 extends IPSModuleStrict
             $lines[] = $type . ' = ' . (int) $seen . 'x';
         }
         $this->SetValue('DiagB51ATypes', implode("\n", $lines));
+    }
+
+    /**
+     * Passive aroTHERM/VWZ control-loop diagnostic.
+     * Observed format: B5 1A 03 04 <counter> <subcommand 32..36>.
+     * The counter is deliberately ignored for grouping. Request and complete
+     * response payload are retained so their data bytes can be mapped later.
+     *
+     * @param array<int, int> $t
+     */
+    private function UpdateB51AControlLoopDiagnostic(array $t, int $p): void
+    {
+        $requestLength = $t[$p + 2] ?? -1;
+        if ($requestLength !== 3 ||
+            ($t[$p + 3] ?? -1) !== 0x04 ||
+            !isset($t[$p + 4], $t[$p + 5])) {
+            return;
+        }
+
+        $subcommand = $t[$p + 5];
+        if ($subcommand < 0x32 || $subcommand > 0x36) {
+            return;
+        }
+
+        // Request is followed by request CRC, ACK, response length.
+        $responseLengthPos = $p + 3 + $requestLength + 2;
+        if (!isset($t[$responseLengthPos])) {
+            return;
+        }
+
+        $responseLength = $t[$responseLengthPos];
+        $responseStart = $responseLengthPos + 1;
+        if ($responseLength < 0 ||
+            ($responseLength > 0 && !isset($t[$responseStart + $responseLength - 1]))) {
+            return;
+        }
+
+        $request = array_slice($t, $p + 3, $requestLength);
+        $response = array_slice($t, $responseStart, $responseLength);
+        $value = 'Request ' . $this->BytesToHex($request) .
+            ' | Response ' . $this->BytesToHex($response);
+
+        $this->SetValue(sprintf('DiagB51A%02X', $subcommand), $value);
     }
 
     /**
