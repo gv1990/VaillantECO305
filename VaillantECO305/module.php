@@ -60,6 +60,12 @@ class VaillantECO305 extends IPSModuleStrict
         $this->RegisterVariableString('DiagB51A35', 'Diagnose: B5-1A 35 letzte Antwort', '', 970);
         $this->RegisterVariableString('DiagB51A36', 'Diagnose: B5-1A 36 letzte Antwort', '', 980);
         $this->RegisterAttributeString('DiagB51ATypesJSON', '{}');
+
+        // B5 14 passive sensor/service traffic diagnostics. No requests are sent.
+        $this->RegisterVariableInteger('DiagB514Count', 'Diagnose: B5-14 Telegramme gesehen', '', 990);
+        $this->RegisterVariableString('DiagLastB514Hex', 'Diagnose: Letztes B5-14 Telegramm', '', 1000);
+        $this->RegisterVariableString('DiagB514Types', 'Diagnose: B5-14 IDs und Antworten', '', 1010);
+        $this->RegisterAttributeString('DiagB514TypesJSON', '{}');
     }
 
     public function ApplyChanges(): void
@@ -194,6 +200,10 @@ class VaillantECO305 extends IPSModuleStrict
             if (($telegram[$p + 1] ?? -1) === 0x24) {
                 $this->IncrementDiagnostic('DiagB524Count');
                 $this->ProcessB524($telegram, $p);
+            } elseif (($telegram[$p + 1] ?? -1) === 0x14) {
+                $this->IncrementDiagnostic('DiagB514Count');
+                $this->SetValue('DiagLastB514Hex', $this->BytesToHex($telegram));
+                $this->UpdateB514TypeDiagnostic($telegram, $p);
             } elseif (($telegram[$p + 1] ?? -1) === 0x1A) {
                 $this->IncrementDiagnostic('DiagB51ACount');
                 $this->SetValue('DiagLastB51AHex', $this->BytesToHex($telegram));
@@ -309,6 +319,82 @@ class VaillantECO305 extends IPSModuleStrict
             ' | Response ' . $this->BytesToHex($response);
 
         $this->SetValue(sprintf('DiagB51A%02X', $subcommand), $value);
+    }
+
+    /**
+     * Collect passive B5-14 request IDs and their latest complete response.
+     * Known aroTHERM sensor traffic commonly uses a five-byte request such as
+     * 05 28 03 FF FF, where 28 identifies the requested value. This function
+     * deliberately records the real bus data before any datatype is assumed.
+     *
+     * @param array<int, int> $t
+     */
+    private function UpdateB514TypeDiagnostic(array $t, int $p): void
+    {
+        $requestLength = $t[$p + 2] ?? -1;
+        if ($requestLength < 1 || $requestLength > 32) {
+            return;
+        }
+
+        $lastRequestByte = $p + 2 + $requestLength;
+        if (!isset($t[$lastRequestByte])) {
+            return;
+        }
+
+        $request = array_slice($t, $p + 3, $requestLength);
+        $responseLengthPos = $p + 3 + $requestLength + 2;
+        if (!isset($t[$responseLengthPos])) {
+            return;
+        }
+
+        $responseLength = $t[$responseLengthPos];
+        $responseStart = $responseLengthPos + 1;
+        if ($responseLength > 0 && !isset($t[$responseStart + $responseLength - 1])) {
+            return;
+        }
+        $response = array_slice($t, $responseStart, $responseLength);
+
+        // For the known 05 <id> 03 FF FF family use the ID as the stable key.
+        // Unknown layouts remain distinguishable by their complete request.
+        if ($requestLength >= 2 && $request[0] === 0x05) {
+            $key = sprintf('ID %02X', $request[1]);
+        } else {
+            $key = sprintf('REQ %02X | %s', $requestLength, $this->BytesToHex($request));
+        }
+
+        $stored = json_decode($this->ReadAttributeString('DiagB514TypesJSON'), true);
+        if (!is_array($stored)) {
+            $stored = [];
+        }
+
+        if (!isset($stored[$key]) && count($stored) >= 64) {
+            return;
+        }
+
+        $seen = isset($stored[$key]['seen']) ? (int) $stored[$key]['seen'] + 1 : 1;
+        $stored[$key] = [
+            'seen' => $seen,
+            'request' => $this->BytesToHex($request),
+            'response' => $this->BytesToHex($response),
+        ];
+
+        $json = json_encode($stored);
+        if (is_string($json)) {
+            $this->WriteAttributeString('DiagB514TypesJSON', $json);
+        }
+
+        ksort($stored, SORT_STRING);
+        $lines = [];
+        foreach ($stored as $type => $entry) {
+            $lines[] = sprintf(
+                '%s = %dx | Request %s | Response %s',
+                $type,
+                (int) ($entry['seen'] ?? 0),
+                (string) ($entry['request'] ?? ''),
+                (string) ($entry['response'] ?? '')
+            );
+        }
+        $this->SetValue('DiagB514Types', implode("\n", $lines));
     }
 
     /**
