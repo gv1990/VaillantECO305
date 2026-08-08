@@ -52,6 +52,7 @@ class VaillantECO305 extends IPSModuleStrict
         // Passive protocol diagnostics. Deliberately not archived.
         $this->RegisterVariableInteger('DiagB524Count', 'Diagnose: B5-24 Telegramme gesehen', '', 900);
         $this->RegisterVariableInteger('DiagB51ACount', 'Diagnose: B5-1A Telegramme gesehen', '', 910);
+        $this->RegisterVariableString('DiagLastB51AHex', 'Diagnose: Letztes B5-1A Telegramm', '', 920);
     }
 
     public function ApplyChanges(): void
@@ -188,6 +189,7 @@ class VaillantECO305 extends IPSModuleStrict
                 $this->ProcessB524($telegram, $p);
             } elseif (($telegram[$p + 1] ?? -1) === 0x1A) {
                 $this->IncrementDiagnostic('DiagB51ACount');
+                $this->SetValue('DiagLastB51AHex', $this->BytesToHex($telegram));
                 $this->ProcessB51A($telegram, $p);
             }
         }
@@ -196,6 +198,16 @@ class VaillantECO305 extends IPSModuleStrict
     private function IncrementDiagnostic(string $ident): void
     {
         $this->SetValue($ident, (int) $this->GetValue($ident) + 1);
+    }
+
+    /** @param array<int, int> $bytes */
+    private function BytesToHex(array $bytes): string
+    {
+        $parts = [];
+        foreach ($bytes as $byte) {
+            $parts[] = sprintf('%02X', $byte);
+        }
+        return implode(' ', $parts);
     }
 
     /**
