@@ -48,6 +48,10 @@ class VaillantECO305 extends IPSModuleStrict
         $this->RegisterVariableFloat('HMUBuildingCircuitFlow', 'Durchfluss Heizkreis [l/h]', '', 290);
         $this->RegisterVariableFloat('HMUFlowPressure', 'HMU Anlagendruck [bar]', '', 300);
         $this->RegisterVariableFloat('HMUSourcePressure', 'HMU Quelldruck [bar]', '', 310);
+
+        // Passive protocol diagnostics. Deliberately not archived.
+        $this->RegisterVariableInteger('DiagB524Count', 'Diagnose: B5-24 Telegramme gesehen', '', 900);
+        $this->RegisterVariableInteger('DiagB51ACount', 'Diagnose: B5-1A Telegramme gesehen', '', 910);
     }
 
     public function ApplyChanges(): void
@@ -73,6 +77,12 @@ class VaillantECO305 extends IPSModuleStrict
         foreach (IPS_GetChildrenIDs($this->InstanceID) as $objectID) {
             $object = IPS_GetObject($objectID);
             if ($object['ObjectType'] !== 2) {
+                continue;
+            }
+
+            // High-frequency counters are only for protocol diagnosis and
+            // must not fill Archive Control with one entry per telegram.
+            if (strncmp($object['ObjectIdent'], 'Diag', 4) === 0) {
                 continue;
             }
 
@@ -174,11 +184,18 @@ class VaillantECO305 extends IPSModuleStrict
             }
 
             if (($telegram[$p + 1] ?? -1) === 0x24) {
+                $this->IncrementDiagnostic('DiagB524Count');
                 $this->ProcessB524($telegram, $p);
             } elseif (($telegram[$p + 1] ?? -1) === 0x1A) {
+                $this->IncrementDiagnostic('DiagB51ACount');
                 $this->ProcessB51A($telegram, $p);
             }
         }
+    }
+
+    private function IncrementDiagnostic(string $ident): void
+    {
+        $this->SetValue($ident, (int) $this->GetValue($ident) + 1);
     }
 
     /**
