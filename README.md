@@ -1,6 +1,6 @@
 # Vaillant ECO305 für IP-Symcon 9
 
-Version 0.4 ist ein **rein passiver** Decoder für Vaillant-eBUS-Telegramme,
+Version 0.5 ist ein **rein passiver** Decoder für Vaillant-eBUS-Telegramme,
 die über einen ESERA ECO305 im Enhanced Mode per TCP an IP-Symcon gelangen.
 
 ## Sicherheitsgrenze
@@ -12,11 +12,11 @@ die über einen ESERA ECO305 im Enhanced Mode per TCP an IP-Symcon gelangen.
 - keine Sicherheits-/Servicebefehle
 - keine generische Raw-Send-Funktion
 
-Version 0.4 enthält absichtlich **keinen** Aufruf von `SendDataToParent()`.
+Version 0.5 enthält absichtlich **keinen** Aufruf von `SendDataToParent()`.
 Kompressordaten werden nur ausgewertet, wenn sie bereits auf dem Bus vorhanden
 sind.
 
-Die Heizkurve wird in Version 0.4 nur gelesen. Eine spätere Schreibfunktion
+Die Heizkurve wird in Version 0.5 nur gelesen. Eine spätere Schreibfunktion
 soll ausschließlich über eine explizite Whitelist für die Heizkurve erfolgen.
 
 ## Archiv
@@ -28,8 +28,10 @@ eBUS-Verkehr.
 
 Die passiven Diagnosewerte für B5-24/B5-1A werden absichtlich nicht archiviert,
 da sie bei jedem Telegramm aktualisiert werden und sonst unnötig viele
-Archiveinträge erzeugen würden. Version 0.4 zeigt zusätzlich das zuletzt
-beobachtete B5-1A-Telegramm als Hex-Text an.
+Archiveinträge erzeugen würden. Version 0.5 zeigt zusätzlich das zuletzt
+beobachtete B5-1A-Telegramm als Hex-Text an und sammelt bis zu 32 verschiedene
+B5-1A-Requesttypen mit ihrer Beobachtungshäufigkeit. Auch diese Diagnose ist
+rein passiv und sendet keine Abfragen auf den eBUS.
 
 ## Verbindung
 

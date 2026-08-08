@@ -53,6 +53,8 @@ class VaillantECO305 extends IPSModuleStrict
         $this->RegisterVariableInteger('DiagB524Count', 'Diagnose: B5-24 Telegramme gesehen', '', 900);
         $this->RegisterVariableInteger('DiagB51ACount', 'Diagnose: B5-1A Telegramme gesehen', '', 910);
         $this->RegisterVariableString('DiagLastB51AHex', 'Diagnose: Letztes B5-1A Telegramm', '', 920);
+        $this->RegisterVariableString('DiagB51ATypes', 'Diagnose: B5-1A Requesttypen', '', 930);
+        $this->RegisterAttributeString('DiagB51ATypesJSON', '{}');
     }
 
     public function ApplyChanges(): void
@@ -190,6 +192,7 @@ class VaillantECO305 extends IPSModuleStrict
             } elseif (($telegram[$p + 1] ?? -1) === 0x1A) {
                 $this->IncrementDiagnostic('DiagB51ACount');
                 $this->SetValue('DiagLastB51AHex', $this->BytesToHex($telegram));
+                $this->UpdateB51ATypeDiagnostic($telegram, $p);
                 $this->ProcessB51A($telegram, $p);
             }
         }
@@ -208,6 +211,55 @@ class VaillantECO305 extends IPSModuleStrict
             $parts[] = sprintf('%02X', $byte);
         }
         return implode(' ', $parts);
+    }
+
+    /**
+     * Collect distinct B5-1A request payloads without transmitting anything.
+     * The list is bounded so unexpected bus traffic cannot grow it forever.
+     *
+     * @param array<int, int> $t
+     */
+    private function UpdateB51ATypeDiagnostic(array $t, int $p): void
+    {
+        $requestLength = $t[$p + 2] ?? -1;
+        if ($requestLength < 0 || $requestLength > 32) {
+            return;
+        }
+
+        $lastRequestByte = $p + 2 + $requestLength;
+        if ($requestLength > 0 && !isset($t[$lastRequestByte])) {
+            return;
+        }
+
+        $request = $requestLength > 0
+            ? array_slice($t, $p + 3, $requestLength)
+            : [];
+        $key = sprintf('%02X | %s', $requestLength, $this->BytesToHex($request));
+
+        $stored = json_decode($this->ReadAttributeString('DiagB51ATypesJSON'), true);
+        if (!is_array($stored)) {
+            $stored = [];
+        }
+
+        if (isset($stored[$key])) {
+            $stored[$key] = (int) $stored[$key] + 1;
+        } elseif (count($stored) < 32) {
+            $stored[$key] = 1;
+        } else {
+            return;
+        }
+
+        $json = json_encode($stored);
+        if (is_string($json)) {
+            $this->WriteAttributeString('DiagB51ATypesJSON', $json);
+        }
+
+        arsort($stored, SORT_NUMERIC);
+        $lines = [];
+        foreach ($stored as $type => $seen) {
+            $lines[] = $type . ' = ' . (int) $seen . 'x';
+        }
+        $this->SetValue('DiagB51ATypes', implode("\n", $lines));
     }
 
     /**
