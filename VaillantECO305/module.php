@@ -66,6 +66,12 @@ class VaillantECO305 extends IPSModuleStrict
         $this->RegisterVariableString('DiagLastB514Hex', 'Diagnose: Letztes B5-14 Telegramm', '', 1000);
         $this->RegisterVariableString('DiagB514Types', 'Diagnose: B5-14 IDs und Antworten', '', 1010);
         $this->RegisterAttributeString('DiagB514TypesJSON', '{}');
+
+        // Retain transient payload changes in B5-1A 32..36. Counter byte 0 is ignored.
+        $this->RegisterVariableInteger('DiagB51AChangeCount', 'Diagnose: B5-1A Nutzdaten-Änderungen', '', 1020);
+        $this->RegisterVariableString('DiagB51AChanges', 'Diagnose: B5-1A geänderte Nutzbytes', '', 1030);
+        $this->RegisterAttributeString('DiagB51APreviousJSON', '{}');
+        $this->RegisterAttributeString('DiagB51AChangesJSON', '{}');
     }
 
     public function ApplyChanges(): void
@@ -315,10 +321,104 @@ class VaillantECO305 extends IPSModuleStrict
 
         $request = array_slice($t, $p + 3, $requestLength);
         $response = array_slice($t, $responseStart, $responseLength);
+        $this->UpdateB51AChangeDiagnostic($subcommand, $response);
         $value = 'Request ' . $this->BytesToHex($request) .
             ' | Response ' . $this->BytesToHex($response);
 
         $this->SetValue(sprintf('DiagB51A%02X', $subcommand), $value);
+    }
+
+    /**
+     * Remember every real payload-byte change for B5-1A 32..36.
+     * Response byte 0 mirrors the rolling request counter and is intentionally
+     * excluded. For each payload byte we retain last transition, min/max byte
+     * value and the number of observed transitions.
+     *
+     * @param array<int, int> $response
+     */
+    private function UpdateB51AChangeDiagnostic(int $subcommand, array $response): void
+    {
+        $previousAll = json_decode($this->ReadAttributeString('DiagB51APreviousJSON'), true);
+        if (!is_array($previousAll)) {
+            $previousAll = [];
+        }
+
+        $subKey = sprintf('%02X', $subcommand);
+        $previous = $previousAll[$subKey] ?? null;
+
+        if (is_array($previous)) {
+            $changes = json_decode($this->ReadAttributeString('DiagB51AChangesJSON'), true);
+            if (!is_array($changes)) {
+                $changes = [];
+            }
+
+            $maxBytes = min(count($previous), count($response));
+            $changedNow = 0;
+            for ($i = 1; $i < $maxBytes; $i++) {
+                $old = (int) $previous[$i];
+                $new = (int) $response[$i];
+                if ($old === $new) {
+                    continue;
+                }
+
+                $key = sprintf('%s:%02d', $subKey, $i);
+                $entry = isset($changes[$key]) && is_array($changes[$key])
+                    ? $changes[$key]
+                    : [];
+
+                $changes[$key] = [
+                    'sub' => $subKey,
+                    'byte' => $i,
+                    'from' => $old,
+                    'to' => $new,
+                    'min' => isset($entry['min']) ? min((int) $entry['min'], $old, $new) : min($old, $new),
+                    'max' => isset($entry['max']) ? max((int) $entry['max'], $old, $new) : max($old, $new),
+                    'changes' => isset($entry['changes']) ? (int) $entry['changes'] + 1 : 1,
+                ];
+                $changedNow++;
+            }
+
+            if ($changedNow > 0) {
+                $json = json_encode($changes);
+                if (is_string($json)) {
+                    $this->WriteAttributeString('DiagB51AChangesJSON', $json);
+                }
+                $this->SetValue(
+                    'DiagB51AChangeCount',
+                    (int) $this->GetValue('DiagB51AChangeCount') + $changedNow
+                );
+                $this->RenderB51AChanges($changes);
+            }
+        }
+
+        $previousAll[$subKey] = array_values($response);
+        $json = json_encode($previousAll);
+        if (is_string($json)) {
+            $this->WriteAttributeString('DiagB51APreviousJSON', $json);
+        }
+    }
+
+    /** @param array<string, mixed> $changes */
+    private function RenderB51AChanges(array $changes): void
+    {
+        ksort($changes, SORT_STRING);
+        $lines = [];
+        foreach ($changes as $entry) {
+            if (!is_array($entry)) {
+                continue;
+            }
+            $lines[] = sprintf(
+                '%s Nutzbyte %02d: %02X -> %02X | Min %02X Max %02X | %dx',
+                (string) ($entry['sub'] ?? '??'),
+                (int) ($entry['byte'] ?? 0),
+                (int) ($entry['from'] ?? 0),
+                (int) ($entry['to'] ?? 0),
+                (int) ($entry['min'] ?? 0),
+                (int) ($entry['max'] ?? 0),
+                (int) ($entry['changes'] ?? 0)
+            );
+        }
+        $this->SetValue('DiagB51AChanges', implode("\n", $lines));
     }
 
     /**
