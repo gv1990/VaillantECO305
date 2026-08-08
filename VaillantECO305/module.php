@@ -10,6 +10,7 @@ declare(strict_types=1);
  * - No EnableTest messages.
  * - No compressor, pump, valve, service or safety commands.
  * - Compressor/HMU telemetry is decoded only when it already appears on eBUS.
+ * - All module status variables are logged locally by IP-Symcon Archive Control.
  *
  * ECO305 mode: Enhanced, TCP server.
  */
@@ -53,6 +54,31 @@ class VaillantECO305 extends IPSModuleStrict
     {
         parent::ApplyChanges();
         $this->SetSummary('ECO305 Enhanced - nur lesen');
+        $this->EnableArchiveLogging();
+    }
+
+    /**
+     * Enable IP-Symcon's local archive and graph for every status variable
+     * directly below this module instance. This does not communicate with eBUS.
+     */
+    private function EnableArchiveLogging(): void
+    {
+        $archives = IPS_GetInstanceListByModuleID('{43192F0B-135B-4CE7-A0A7-1475603F3060}');
+        if ($archives === []) {
+            $this->SendDebug('Archive', 'Archive Control nicht gefunden', 0);
+            return;
+        }
+
+        $archiveID = $archives[0];
+        foreach (IPS_GetChildrenIDs($this->InstanceID) as $objectID) {
+            $object = IPS_GetObject($objectID);
+            if ($object['ObjectType'] !== 2) {
+                continue;
+            }
+
+            AC_SetLoggingStatus($archiveID, $objectID, true);
+            AC_SetGraphStatus($archiveID, $objectID, true);
+        }
     }
 
     /**
