@@ -3,24 +3,41 @@
 declare(strict_types=1);
 
 /**
- * Vaillant ECO305 passive eBUS decoder for IP-Symcon 9.
+ * Vaillant ECO305 eBUS decoder for IP-Symcon 9.
  *
  * SAFETY DESIGN:
- * - Receive only. There is deliberately NO SendDataToParent() call.
+ * - Passive decoding remains enabled for all existing values.
+ * - Optional active traffic is restricted to two hard-coded HMU read requests.
  * - No EnableTest messages.
  * - No compressor, pump, valve, service or safety commands.
- * - Compressor/HMU telemetry is decoded only when it already appears on eBUS.
+ * - No caller-controlled raw messages; only two fixed read telegrams exist.
  * - All module status variables are logged locally by IP-Symcon Archive Control.
  *
  * ECO305 mode: Enhanced, TCP server.
  */
 class VaillantECO305 extends IPSModuleStrict
 {
-    private const ECO_SYN = "\xC6\xAA";
+    private const PARENT_DATA_ID = '{79827379-F36E-4ADA-8A95-5F8D1DC92FA9}';
+    private const ENH_RES_RESETTED = 0x00;
+    private const ENH_RES_RECEIVED = 0x01;
+    private const ENH_RES_STARTED = 0x02;
+    private const ENH_RES_FAILED = 0x0A;
+    private const ENH_RES_ERROR_EBUS = 0x0B;
+    private const ENH_RES_ERROR_HOST = 0x0C;
+    private const EBUS_ESC = 0xA9;
+    private const EBUS_SYN = 0xAA;
+    private const EBUS_ACK = 0x00;
+    private const EBUS_NAK = 0xFF;
+    private const OWN_MASTER = 0x31;
+    private const HMU_ADDRESS = 0x08;
 
     public function Create(): void
     {
         parent::Create();
+
+        $this->RegisterPropertyBoolean('EnableActivePowerPolling', false);
+        $this->RegisterPropertyInteger('PowerPollIntervalSeconds', 60);
+        $this->RegisterTimer('PowerPoll', 0, 'VECO_PollPower($_IPS["TARGET"]);');
 
         // B5 24 - sensoCOMFORT / system values
         $this->RegisterVariableFloat('OutsideTemperature', 'Außentemperatur', '~Temperature', 10);
@@ -73,13 +90,70 @@ class VaillantECO305 extends IPSModuleStrict
         $this->RegisterVariableString('DiagB51AChanges', 'Diagnose: B5-1A geänderte Nutzbytes', '', 1030);
         $this->RegisterAttributeString('DiagB51APreviousJSON', '{}');
         $this->RegisterAttributeString('DiagB51AChangesJSON', '{}');
+
+        $this->RegisterVariableString('PowerReadStatus', 'Leistungsabfrage Status', '', 1040);
+        $this->RegisterVariableString('PowerReadLastResponse', 'Leistungsabfrage letzte Antwort', '', 1050);
     }
 
     public function ApplyChanges(): void
     {
         parent::ApplyChanges();
-        $this->SetSummary('ECO305 Enhanced - nur lesen - V0.9');
+        $enabled = $this->ReadPropertyBoolean('EnableActivePowerPolling');
+        $interval = max(30, $this->ReadPropertyInteger('PowerPollIntervalSeconds'));
+        $this->SetTimerInterval('PowerPoll', $enabled ? $interval * 1000 : 0);
+        $this->SetSummary($enabled
+            ? 'ECO305 Enhanced - Telemetrie lesen - V1.0'
+            : 'ECO305 Enhanced - passiv - V1.0');
+
+        $this->SetBuffer('PowerReadState', '');
+        $this->SetBuffer('EnhancedRxPartial', '');
+        $this->SetBuffer('PassiveFrame', '');
+        $this->SetBuffer('PassiveEscape', '0');
+        $this->SetBuffer('PassiveSynchronized', '0');
+        $this->SetBuffer('EnhancedInitialized', '0');
+        if ($this->GetBuffer('NextPowerRegister') === '') {
+            $this->SetBuffer('NextPowerRegister', 'environmental');
+        }
+
+        if ($enabled) {
+            $this->SetValue('PowerReadStatus', 'Initialisierung angefordert');
+            $this->SendEnhanced(0x00, 0x01);
+        } else {
+            $this->SetValue('PowerReadStatus', 'Deaktiviert – rein passiver Empfang');
+        }
         $this->EnableArchiveLogging();
+    }
+
+    public function GetConfigurationForm(): string
+    {
+        return json_encode([
+            'elements' => [
+                [
+                    'type'    => 'CheckBox',
+                    'name'    => 'EnableActivePowerPolling',
+                    'caption' => 'Leistungswerte aktiv abfragen (ausschließlich lesen)'
+                ],
+                [
+                    'type'    => 'NumberSpinner',
+                    'name'    => 'PowerPollIntervalSeconds',
+                    'caption' => 'Abfrageintervall je Register (Sekunden)',
+                    'minimum' => 30,
+                    'maximum' => 3600,
+                    'suffix'  => ' s'
+                ],
+                [
+                    'type'    => 'Label',
+                    'caption' => 'Es werden ausschließlich die HMU-Leseregister 32 23 (Umweltleistung) und 32 24 (Aufnahmeleistung) abgefragt. Keine Service-, Test- oder Stellbefehle.'
+                ]
+            ],
+            'actions' => [
+                [
+                    'type'    => 'Button',
+                    'caption' => 'Leistungsabfrage jetzt starten',
+                    'onClick' => 'VECO_PollPower($id);'
+                ]
+            ]
+        ], JSON_THROW_ON_ERROR);
     }
 
     /**
@@ -103,7 +177,8 @@ class VaillantECO305 extends IPSModuleStrict
 
             // High-frequency counters are only for protocol diagnosis and
             // must not fill Archive Control with one entry per telegram.
-            if (strncmp($object['ObjectIdent'], 'Diag', 4) === 0) {
+            if (strncmp($object['ObjectIdent'], 'Diag', 4) === 0 ||
+                strncmp($object['ObjectIdent'], 'PowerRead', 9) === 0) {
                 continue;
             }
 
@@ -127,72 +202,535 @@ class VaillantECO305 extends IPSModuleStrict
             return '';
         }
 
-        $storedHex = $this->GetBuffer('RxEnhanced');
-        $stored = $storedHex !== '' ? hex2bin($storedHex) : '';
-        if ($stored === false) {
-            $stored = '';
+        $partialHex = $this->GetBuffer('EnhancedRxPartial');
+        $partial = $partialHex !== '' ? hex2bin($partialHex) : '';
+        if ($partial === false) {
+            $partial = '';
         }
 
-        $data = $stored . $incoming;
-        $parts = explode(self::ECO_SYN, $data);
+        $data = $partial . $incoming;
+        $length = strlen($data);
+        $position = 0;
 
-        if (count($parts) < 2) {
-            if (strlen($data) > 8192) {
-                $data = substr($data, -8192);
-            }
-            $this->SetBuffer('RxEnhanced', bin2hex($data));
-            return '';
-        }
+        while ($position < $length) {
+            $first = ord($data[$position]);
 
-        // Anything before the first ECO SYN is an incomplete predecessor.
-        // Process only telegrams that are closed by the next SYN.
-        for ($i = 1, $n = count($parts) - 1; $i < $n; $i++) {
-            if ($parts[$i] === '') {
+            // Plain bytes are legal in the enhanced stream and mean a
+            // normally received eBUS symbol.
+            if (($first & 0x80) === 0) {
+                $position++;
+                $this->HandleEnhancedEvent(self::ENH_RES_RECEIVED, $first);
                 continue;
             }
 
-            $telegram = $this->DecodeEnhanced($parts[$i]);
-            if ($telegram !== []) {
-                $this->ProcessTelegram($telegram);
+            $kind = $first & 0xC0;
+            if ($kind === 0x80) {
+                // Orphaned second byte: discard it and regain framing.
+                $position++;
+                continue;
             }
+
+            if (($position + 1) >= $length) {
+                break;
+            }
+
+            $second = ord($data[$position + 1]);
+            if (($second & 0xC0) !== 0x80) {
+                $position++;
+                continue;
+            }
+
+            $command = ($first >> 2) & 0x0F;
+            $value = (($first & 0x03) << 6) | ($second & 0x3F);
+            $position += 2;
+            $this->HandleEnhancedEvent($command, $value);
         }
 
-        $rest = self::ECO_SYN . $parts[count($parts) - 1];
-        if (strlen($rest) > 8192) {
-            $rest = substr($rest, -8192);
-        }
-        $this->SetBuffer('RxEnhanced', bin2hex($rest));
+        $rest = substr($data, $position);
+        $this->SetBuffer('EnhancedRxPartial', bin2hex($rest));
 
         return '';
     }
 
-    /** @return array<int, int> */
-    private function DecodeEnhanced(string $raw): array
+    private function HandleEnhancedEvent(int $command, int $value): void
     {
-        $out = [];
-        $len = strlen($raw);
-
-        for ($i = 0; $i < $len; $i++) {
-            $b1 = ord($raw[$i]);
-
-            if (($b1 & 0x80) === 0) {
-                $out[] = $b1;
-                continue;
+        if ($command === self::ENH_RES_RESETTED) {
+            $this->SetBuffer('PowerReadState', '');
+            $this->SetBuffer('EnhancedInitialized', '1');
+            $this->SetValue('PowerReadStatus', 'ECO305 initialisiert');
+            if ($this->ReadPropertyBoolean('EnableActivePowerPolling')) {
+                $this->StartPowerRead();
             }
-
-            if (($i + 1) >= $len) {
-                break;
-            }
-
-            $b2 = ord($raw[++$i]);
-            if (($b2 & 0x40) !== 0) {
-                [$b1, $b2] = [$b2, $b1];
-            }
-
-            $out[] = ($b2 & 0x3F) | (($b1 & 0x03) << 6);
+            return;
         }
 
-        return $out;
+        if ($command === self::ENH_RES_STARTED ||
+            $command === self::ENH_RES_FAILED ||
+            $command === self::ENH_RES_ERROR_EBUS ||
+            $command === self::ENH_RES_ERROR_HOST) {
+            $this->HandlePowerProtocolEvent($command, $value);
+            return;
+        }
+
+        if ($command !== self::ENH_RES_RECEIVED) {
+            return;
+        }
+
+        // The active request consumes the same raw symbols, but passive
+        // decoding continues in parallel so no existing telemetry is lost.
+        $this->HandlePowerProtocolEvent($command, $value);
+        $this->AppendPassiveSymbol($value);
+    }
+
+    private function AppendPassiveSymbol(int $value): void
+    {
+        if ($value === self::EBUS_SYN) {
+            $frameHex = $this->GetBuffer('PassiveFrame');
+            if ($this->GetBuffer('PassiveSynchronized') === '1' && $frameHex !== '') {
+                $frame = hex2bin($frameHex);
+                if ($frame !== false && $frame !== '') {
+                    $this->ProcessTelegram(array_values(unpack('C*', $frame)));
+                }
+            }
+            $this->SetBuffer('PassiveFrame', '');
+            $this->SetBuffer('PassiveEscape', '0');
+            $this->SetBuffer('PassiveSynchronized', '1');
+            return;
+        }
+
+        // Ignore a partial predecessor after startup/reload. The first SYN
+        // establishes a clean eBUS telegram boundary.
+        if ($this->GetBuffer('PassiveSynchronized') !== '1') {
+            return;
+        }
+
+        if ($this->GetBuffer('PassiveEscape') === '1') {
+            if ($value === 0x00) {
+                $value = self::EBUS_ESC;
+            } elseif ($value === 0x01) {
+                $value = self::EBUS_SYN;
+            } else {
+                $this->SetBuffer('PassiveFrame', '');
+                $this->SetBuffer('PassiveEscape', '0');
+                return;
+            }
+            $this->SetBuffer('PassiveEscape', '0');
+        } elseif ($value === self::EBUS_ESC) {
+            $this->SetBuffer('PassiveEscape', '1');
+            return;
+        }
+
+        $frameHex = $this->GetBuffer('PassiveFrame') . sprintf('%02x', $value);
+        if (strlen($frameHex) > 16384) {
+            $frameHex = substr($frameHex, -16384);
+        }
+        $this->SetBuffer('PassiveFrame', $frameHex);
+    }
+
+    /**
+     * Start one whitelisted HMU read. Calls alternate between environmental
+     * power (32 23) and consumed electrical power (32 24).
+     */
+    public function PollPower(): void
+    {
+        if (!$this->ReadPropertyBoolean('EnableActivePowerPolling')) {
+            return;
+        }
+
+        $state = $this->ReadPowerState();
+        if (($state['active'] ?? false) === true) {
+            $started = (int) ($state['started'] ?? 0);
+            if ($started > 0 && (time() - $started) <= 15) {
+                return;
+            }
+            $this->AbortPowerRead('Vorherige Abfrage nach Zeitüberschreitung verworfen');
+            return;
+        }
+
+        if ($this->GetBuffer('EnhancedInitialized') !== '1') {
+            $this->SetValue('PowerReadStatus', 'ECO305 Initialisierung gesendet');
+            $this->SendEnhanced(0x00, 0x01);
+            return;
+        }
+
+        $this->StartPowerRead();
+    }
+
+    private function StartPowerRead(): void
+    {
+        $current = $this->ReadPowerState();
+        if (($current['active'] ?? false) === true) {
+            return;
+        }
+
+        $key = $this->GetBuffer('NextPowerRegister');
+        if ($key !== 'consumed') {
+            $key = 'environmental';
+        }
+        $subId = $key === 'environmental' ? 0x23 : 0x24;
+
+        // Fixed read-only telegram: source 31, HMU 08, B5 1A,
+        // request 05 FF 32 23/24. No caller-supplied raw bytes are accepted.
+        $master = [
+            self::OWN_MASTER,
+            self::HMU_ADDRESS,
+            0xB5,
+            0x1A,
+            0x04,
+            0x05,
+            0xFF,
+            0x32,
+            $subId
+        ];
+        $masterWire = $this->EscapeEbusBytes($master);
+        $crc = $this->CalculateCrc($masterWire);
+        $txWire = array_merge(array_slice($masterWire, 1), $this->EscapeEbusBytes([$crc]));
+
+        $state = [
+            'active'           => true,
+            'started'          => time(),
+            'stage'            => 'wait_start',
+            'key'              => $key,
+            'request'          => $master,
+            'txWire'           => $txWire,
+            'txPos'            => 0,
+            'lastSent'         => -1,
+            'responseLogical'  => [],
+            'responseExpected' => 0,
+            'responseCrc'      => 0,
+            'responseEscape'   => false,
+            'responseCrcBytes' => [],
+            'responseValid'    => false
+        ];
+        $this->WritePowerState($state);
+        $this->SetValue('PowerReadStatus', $key === 'environmental'
+            ? 'Umweltleistung wird gelesen'
+            : 'Aufnahmeleistung wird gelesen');
+
+        $this->SendEnhanced(0x02, self::OWN_MASTER);
+    }
+
+    private function HandlePowerProtocolEvent(int $command, int $value): void
+    {
+        $state = $this->ReadPowerState();
+        if (($state['active'] ?? false) !== true) {
+            return;
+        }
+
+        if ($command === self::ENH_RES_FAILED) {
+            $this->AbortPowerRead('Buszugriff belegt – nächster Versuch folgt');
+            return;
+        }
+        if ($command === self::ENH_RES_ERROR_EBUS || $command === self::ENH_RES_ERROR_HOST) {
+            $this->AbortPowerRead('ECO305 Kommunikationsfehler ' . sprintf('%02X', $value));
+            return;
+        }
+
+        $stage = (string) ($state['stage'] ?? '');
+        if ($stage === 'wait_start') {
+            if ($command !== self::ENH_RES_STARTED || $value !== self::OWN_MASTER) {
+                return;
+            }
+            $state['stage'] = 'send_master';
+            $this->SendNextPowerByte($state);
+            return;
+        }
+
+        if ($command !== self::ENH_RES_RECEIVED) {
+            return;
+        }
+
+        if ($stage === 'send_master') {
+            if ($value !== (int) ($state['lastSent'] ?? -1)) {
+                $this->AbortPowerRead('Unerwartetes Echo beim Senden');
+                return;
+            }
+            $state['txPos'] = (int) $state['txPos'] + 1;
+            if ($state['txPos'] < count($state['txWire'])) {
+                $this->SendNextPowerByte($state);
+                return;
+            }
+            $state['stage'] = 'wait_command_ack';
+            $this->WritePowerState($state);
+            return;
+        }
+
+        if ($stage === 'wait_command_ack') {
+            if ($value !== self::EBUS_ACK) {
+                $this->AbortPowerRead('HMU hat die Leseabfrage nicht bestätigt');
+                return;
+            }
+            $state['stage'] = 'receive_response';
+            $this->WritePowerState($state);
+            return;
+        }
+
+        if ($stage === 'receive_response') {
+            $this->ConsumePowerResponseByte($state, $value);
+            return;
+        }
+
+        if ($stage === 'send_response_ack') {
+            if ($value !== (int) ($state['lastSent'] ?? -1)) {
+                $this->AbortPowerRead('Unerwartetes Echo der Antwortbestätigung');
+                return;
+            }
+            $state['stage'] = 'send_syn';
+            $state['lastSent'] = self::EBUS_SYN;
+            $this->WritePowerState($state);
+            $this->SendEnhanced(0x01, self::EBUS_SYN);
+            return;
+        }
+
+        if ($stage === 'send_syn' && $value === self::EBUS_SYN) {
+            $this->CompletePowerRead($state);
+        }
+    }
+
+    /** @param array<string, mixed> $state */
+    private function SendNextPowerByte(array $state): void
+    {
+        $position = (int) $state['txPos'];
+        $wire = $state['txWire'];
+        if (!is_array($wire) || !isset($wire[$position])) {
+            $this->AbortPowerRead('Interner Sendefehler');
+            return;
+        }
+
+        $state['lastSent'] = (int) $wire[$position];
+        $this->WritePowerState($state);
+        $this->SendEnhanced(0x01, (int) $wire[$position]);
+    }
+
+    /** @param array<string, mixed> $state */
+    private function ConsumePowerResponseByte(array $state, int $raw): void
+    {
+        $logical = is_array($state['responseLogical'] ?? null) ? $state['responseLogical'] : [];
+        $expected = (int) ($state['responseExpected'] ?? 0);
+
+        // Once length + payload are complete, the following logical byte is
+        // the response CRC and must not be included in its own calculation.
+        if ($expected > 0 && count($logical) >= $expected) {
+            $crcBytes = is_array($state['responseCrcBytes'] ?? null) ? $state['responseCrcBytes'] : [];
+            $crcBytes[] = $raw;
+            $state['responseCrcBytes'] = $crcBytes;
+            $decodedCrc = $this->DecodeSingleEscapedByte($crcBytes);
+            if ($decodedCrc === null) {
+                $this->WritePowerState($state);
+                return;
+            }
+
+            $valid = $decodedCrc === (int) $state['responseCrc'];
+            $state['responseValid'] = $valid;
+            $state['stage'] = 'send_response_ack';
+            $state['lastSent'] = $valid ? self::EBUS_ACK : self::EBUS_NAK;
+            $this->WritePowerState($state);
+            $this->SendEnhanced(0x01, (int) $state['lastSent']);
+            return;
+        }
+
+        $state['responseCrc'] = $this->UpdateCrc((int) $state['responseCrc'], $raw);
+        $escape = (bool) ($state['responseEscape'] ?? false);
+        if ($escape) {
+            if ($raw === 0x00) {
+                $logical[] = self::EBUS_ESC;
+            } elseif ($raw === 0x01) {
+                $logical[] = self::EBUS_SYN;
+            } else {
+                $this->AbortPowerRead('Ungültige Escape-Sequenz in HMU-Antwort');
+                return;
+            }
+            $state['responseEscape'] = false;
+        } elseif ($raw === self::EBUS_ESC) {
+            $state['responseEscape'] = true;
+            $this->WritePowerState($state);
+            return;
+        } elseif ($raw === self::EBUS_SYN) {
+            $this->AbortPowerRead('HMU-Antwort vorzeitig beendet');
+            return;
+        } else {
+            $logical[] = $raw;
+        }
+
+        if (count($logical) === 1) {
+            $payloadLength = (int) $logical[0];
+            if ($payloadLength < 4 || $payloadLength > 32) {
+                $this->AbortPowerRead('Unplausible HMU-Antwortlänge');
+                return;
+            }
+            $state['responseExpected'] = 1 + $payloadLength;
+        }
+        $state['responseLogical'] = $logical;
+        $this->WritePowerState($state);
+    }
+
+    /** @param array<string, mixed> $state */
+    private function CompletePowerRead(array $state): void
+    {
+        $valid = (bool) ($state['responseValid'] ?? false);
+        $logical = is_array($state['responseLogical'] ?? null) ? $state['responseLogical'] : [];
+        $key = (string) ($state['key'] ?? '');
+
+        if ($valid && $this->DecodeActivePowerResponse($key, $logical)) {
+            $this->SetValue('PowerReadLastResponse', strtoupper(implode(' ', array_map(
+                static fn (int $byte): string => sprintf('%02x', $byte),
+                $logical
+            ))));
+            $this->SetValue('PowerReadStatus', $key === 'environmental'
+                ? 'Umweltleistung erfolgreich gelesen'
+                : 'Aufnahmeleistung erfolgreich gelesen');
+            $this->SetBuffer('NextPowerRegister', $key === 'environmental' ? 'consumed' : 'environmental');
+        } elseif (!$valid) {
+            $this->SetValue('PowerReadStatus', 'HMU-Antwort mit ungültiger Prüfsumme');
+        }
+
+        $this->SetBuffer('PowerReadState', '');
+    }
+
+    /** @param array<int, int> $logical */
+    private function DecodeActivePowerResponse(string $key, array $logical): bool
+    {
+        if (count($logical) < 5) {
+            $this->SetValue('PowerReadStatus', 'HMU-Antwort enthält keinen Leistungswert');
+            return false;
+        }
+
+        // Byte 0 is the slave length; the first three payload bytes are
+        // ignored by the official Vaillant HMU definition.
+        $payload = array_slice($logical, 4);
+        $value = null;
+        if (count($payload) >= 2) {
+            $raw = $payload[0] | ($payload[1] << 8);
+            $value = $raw / 10.0;
+        } elseif (isset($payload[0])) {
+            $raw = $payload[0] >= 0x80 ? $payload[0] - 0x100 : $payload[0];
+            $value = $raw / 10.0;
+        }
+
+        if ($value === null || $value < 0.0 || $value > 100.0) {
+            $this->SetValue('PowerReadStatus', 'HMU-Leistungswert unplausibel');
+            return false;
+        }
+
+        if ($key === 'environmental') {
+            $this->SetValue('HMUCurrentEnvironmentalPower', $value);
+        } elseif ($key === 'consumed') {
+            $this->SetValue('HMUCurrentConsumedPower', $value);
+        } else {
+            return false;
+        }
+        $this->UpdateThermalPower();
+        return true;
+    }
+
+    private function AbortPowerRead(string $message): void
+    {
+        $state = $this->ReadPowerState();
+        $stage = (string) ($state['stage'] ?? '');
+        $wasActive = ($state['active'] ?? false) === true;
+        $this->SetValue('PowerReadStatus', $message);
+        $this->SetBuffer('PowerReadState', '');
+
+        if ($wasActive) {
+            // Release an arbitration still in progress, or end a transaction
+            // already won. This is the only non-read payload used here and is
+            // the mandatory eBUS synchronisation symbol, not a device command.
+            $this->SendEnhanced($stage === 'wait_start' ? 0x02 : 0x01, self::EBUS_SYN);
+        }
+    }
+
+    /** @return array<string, mixed> */
+    private function ReadPowerState(): array
+    {
+        $json = $this->GetBuffer('PowerReadState');
+        if ($json === '') {
+            return [];
+        }
+        $state = json_decode($json, true);
+        return is_array($state) ? $state : [];
+    }
+
+    /** @param array<string, mixed> $state */
+    private function WritePowerState(array $state): void
+    {
+        $this->SetBuffer('PowerReadState', json_encode($state, JSON_THROW_ON_ERROR));
+    }
+
+    /** @param array<int, int> $bytes @return array<int, int> */
+    private function EscapeEbusBytes(array $bytes): array
+    {
+        $wire = [];
+        foreach ($bytes as $byte) {
+            if ($byte === self::EBUS_ESC) {
+                $wire[] = self::EBUS_ESC;
+                $wire[] = 0x00;
+            } elseif ($byte === self::EBUS_SYN) {
+                $wire[] = self::EBUS_ESC;
+                $wire[] = 0x01;
+            } else {
+                $wire[] = $byte;
+            }
+        }
+        return $wire;
+    }
+
+    /** @param array<int, int> $wire */
+    private function CalculateCrc(array $wire): int
+    {
+        $crc = 0;
+        foreach ($wire as $byte) {
+            $crc = $this->UpdateCrc($crc, $byte);
+        }
+        return $crc;
+    }
+
+    private function UpdateCrc(int $crc, int $value): int
+    {
+        $crc = ($crc ^ $value) & 0xFF;
+        for ($bit = 0; $bit < 8; $bit++) {
+            $crc = ($crc & 0x80) !== 0
+                ? (($crc << 1) ^ 0x9B) & 0xFF
+                : ($crc << 1) & 0xFF;
+        }
+        return $crc;
+    }
+
+    /** @param array<int, int> $bytes */
+    private function DecodeSingleEscapedByte(array $bytes): ?int
+    {
+        if ($bytes === []) {
+            return null;
+        }
+        if ($bytes[0] !== self::EBUS_ESC) {
+            return $bytes[0];
+        }
+        if (!isset($bytes[1])) {
+            return null;
+        }
+        if ($bytes[1] === 0x00) {
+            return self::EBUS_ESC;
+        }
+        if ($bytes[1] === 0x01) {
+            return self::EBUS_SYN;
+        }
+        return null;
+    }
+
+    private function SendEnhanced(int $command, int $value): void
+    {
+        $first = 0xC0 | (($command & 0x0F) << 2) | (($value & 0xC0) >> 6);
+        $second = 0x80 | ($value & 0x3F);
+        $binary = chr($first) . chr($second);
+
+        try {
+            $this->SendDataToParent(json_encode([
+                'DataID' => self::PARENT_DATA_ID,
+                'Buffer' => bin2hex($binary)
+            ], JSON_THROW_ON_ERROR));
+        } catch (Throwable $error) {
+            $this->SetValue('PowerReadStatus', 'Senden fehlgeschlagen: ' . $error->getMessage());
+            $this->SetBuffer('PowerReadState', '');
+        }
     }
 
     /** @param array<int, int> $telegram */
@@ -665,7 +1203,7 @@ class VaillantECO305 extends IPSModuleStrict
     /**
      * Normal HMU live monitor (08.hmu.tsp): B5 1A 04 05 counter 32 subId.
      * First three response bytes are ignored by the Vaillant definition.
-     * This method only watches already-present telegrams.
+     * Handles matching passive traffic and the two whitelisted active reads.
      *
      * @param array<int, int> $t
      */
@@ -807,7 +1345,14 @@ class VaillantECO305 extends IPSModuleStrict
     /** @param array<int, int> $bytes */
     private function SetUIN10(string $ident, array $bytes): void
     {
-        $value = $this->UInt16LE($bytes);
+        if (!isset($bytes[0])) {
+            return;
+        }
+        if (isset($bytes[1])) {
+            $value = $this->UInt16LE($bytes);
+        } else {
+            $value = $bytes[0] >= 0x80 ? $bytes[0] - 0x100 : $bytes[0];
+        }
         if ($value === null) {
             return;
         }
