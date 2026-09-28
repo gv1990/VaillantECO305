@@ -7,10 +7,10 @@ declare(strict_types=1);
  *
  * SAFETY DESIGN:
  * - Passive decoding remains enabled for all existing values.
- * - Optional active traffic is restricted to two hard-coded HMU read requests.
+ * - Optional active traffic is restricted to hard-coded official HMU reads.
  * - No EnableTest messages.
  * - No compressor, pump, valve, service or safety commands.
- * - No caller-controlled raw messages; only two fixed read telegrams exist.
+ * - No caller-controlled raw messages; all read telegrams are whitelisted.
  * - All module status variables are logged locally by IP-Symcon Archive Control.
  *
  * ECO305 mode: Enhanced, TCP server.
@@ -63,6 +63,7 @@ class VaillantECO305 extends IPSModuleStrict
         $this->RegisterVariableFloat('HMUCurrentConsumedPower', 'HMU aktuelle Aufnahmeleistung [kW]', '', 260);
         $this->RegisterVariableFloat('HMUCompressorUtilization', 'Kompressor Auslastung [%] (nur lesen)', '', 270);
         $this->RegisterVariableFloat('HMUAirIntakeTemperature', 'HMU Luftansaugtemperatur', '~Temperature', 280);
+        $this->RegisterVariableFloat('HMUSourceOutputTemperature', 'HMU Quellentemperatur Ausgang', '~Temperature', 285);
         $this->RegisterVariableFloat('HMUBuildingCircuitFlow', 'Durchfluss Heizkreis [l/h]', '', 290);
         $this->RegisterVariableFloat('HMUFlowPressure', 'HMU Anlagendruck [bar]', '', 300);
         $this->RegisterVariableFloat('HMUSourcePressure', 'HMU Quelldruck [bar]', '', 310);
@@ -91,8 +92,8 @@ class VaillantECO305 extends IPSModuleStrict
         $this->RegisterAttributeString('DiagB51APreviousJSON', '{}');
         $this->RegisterAttributeString('DiagB51AChangesJSON', '{}');
 
-        $this->RegisterVariableString('PowerReadStatus', 'Leistungsabfrage Status', '', 1040);
-        $this->RegisterVariableString('PowerReadLastResponse', 'Leistungsabfrage letzte Antwort', '', 1050);
+        $this->RegisterVariableString('PowerReadStatus', 'HMU-Leseabfrage Status', '', 1040);
+        $this->RegisterVariableString('PowerReadLastResponse', 'HMU-Leseabfrage letzte Antwort', '', 1050);
     }
 
     public function ApplyChanges(): void
@@ -102,8 +103,8 @@ class VaillantECO305 extends IPSModuleStrict
         $interval = max(30, $this->ReadPropertyInteger('PowerPollIntervalSeconds'));
         $this->SetTimerInterval('PowerPoll', $enabled ? $interval * 1000 : 0);
         $this->SetSummary($enabled
-            ? 'ECO305 Enhanced - Telemetrie lesen - V1.3'
-            : 'ECO305 Enhanced - passiv - V1.3');
+            ? 'ECO305 Enhanced - Telemetrie lesen - V1.4'
+            : 'ECO305 Enhanced - passiv - V1.4');
 
         $this->SetBuffer('PowerReadState', '');
         $this->SetBuffer('EnhancedRxPartial', '');
@@ -114,12 +115,22 @@ class VaillantECO305 extends IPSModuleStrict
         // Some ECO305 firmware does not answer a repeated INIT on an existing
         // TCP session, therefore active reads start directly on this stream.
         $this->SetBuffer('EnhancedInitialized', '1');
-        if ($this->GetBuffer('NextPowerRegister') === '') {
-            $this->SetBuffer('NextPowerRegister', 'environmental');
+        if ($this->GetBuffer('TelemetryQueueIndex') === '') {
+            $this->SetBuffer('TelemetryQueueIndex', '0');
+        }
+
+        // These legacy placeholders have no confirmed register on this plant.
+        // Keep the objects for upgrade compatibility, but do not present a
+        // permanent "Nie" as though it were a failed measurement.
+        foreach (['SystemFlowTemperature', 'HotWaterFlow', 'HeatingCircuit1Flow', 'HMUSourceInputTemperature'] as $ident) {
+            $objectID = @IPS_GetObjectIDByIdent($ident, $this->InstanceID);
+            if ($objectID !== false) {
+                IPS_SetHidden($objectID, true);
+            }
         }
 
         if ($enabled) {
-            $this->SetValue('PowerReadStatus', 'Leistungsabfrage wird gestartet');
+            $this->SetValue('PowerReadStatus', 'HMU-Leseabfrage wird gestartet');
             $this->StartPowerRead();
         } else {
             $this->SetValue('PowerReadStatus', 'Deaktiviert – rein passiver Empfang');
@@ -134,7 +145,7 @@ class VaillantECO305 extends IPSModuleStrict
                 [
                     'type'    => 'CheckBox',
                     'name'    => 'EnableActivePowerPolling',
-                    'caption' => 'Leistungswerte aktiv abfragen (ausschließlich lesen)'
+                    'caption' => 'HMU-Telemetrie aktiv abfragen (ausschließlich lesen)'
                 ],
                 [
                     'type'    => 'NumberSpinner',
@@ -146,13 +157,13 @@ class VaillantECO305 extends IPSModuleStrict
                 ],
                 [
                     'type'    => 'Label',
-                    'caption' => 'Es werden ausschließlich die HMU-Live-Monitor-Leseregister 32 23 (Umweltleistung) und 32 24 (Aufnahmeleistung) abgefragt. Keine Test- oder Stellbefehle.'
+                    'caption' => 'Es werden ausschließlich fest hinterlegte offizielle HMU-Leseregister abgefragt. Keine frei eingebbaren Telegramme, keine Test- oder Stellbefehle.'
                 ]
             ],
             'actions' => [
                 [
                     'type'    => 'Button',
-                    'caption' => 'Leistungsabfrage jetzt starten',
+                    'caption' => 'HMU-Leseabfrage jetzt starten',
                     'onClick' => 'VECO_PollPower($id);'
                 ]
             ]
@@ -330,10 +341,7 @@ class VaillantECO305 extends IPSModuleStrict
         $this->SetBuffer('PassiveFrame', $frameHex);
     }
 
-    /**
-     * Start one whitelisted HMU read. Calls alternate between environmental
-     * power (32 23) and consumed electrical power (32 24).
-     */
+    /** Start one whitelisted, read-only HMU telemetry request. */
     public function PollPower(): void
     {
         if (!$this->ReadPropertyBoolean('EnableActivePowerPolling')) {
@@ -360,25 +368,23 @@ class VaillantECO305 extends IPSModuleStrict
             return;
         }
 
-        $key = $this->GetBuffer('NextPowerRegister');
-        if ($key !== 'consumed') {
-            $key = 'environmental';
+        $definitions = $this->GetTelemetryDefinitions();
+        $queueIndex = (int) $this->GetBuffer('TelemetryQueueIndex');
+        if ($queueIndex < 0 || $queueIndex >= count($definitions)) {
+            $queueIndex = 0;
         }
-        $subId = $key === 'environmental' ? 0x23 : 0x24;
+        $definition = $definitions[$queueIndex];
+        $this->SetBuffer('TelemetryQueueIndex', (string) (($queueIndex + 1) % count($definitions)));
 
-        // Fixed read-only live-monitor telegram: source 31, HMU 08, B5 1A,
-        // request 05 00 32 23/24. No caller-supplied raw bytes are accepted.
-        $master = [
+        // Fixed read-only telegram: source 31, HMU 08, B5 1A followed by
+        // one whitelisted official request. No caller-supplied bytes exist.
+        $master = array_merge([
             self::OWN_MASTER,
             self::HMU_ADDRESS,
             0xB5,
             0x1A,
-            0x04,
-            0x05,
-            0x00,
-            0x32,
-            $subId
-        ];
+            0x04
+        ], $definition['request']);
         $masterWire = $this->EscapeEbusBytes($master);
         $crc = $this->CalculateCrc($masterWire);
         $txWire = array_merge(array_slice($masterWire, 1), $this->EscapeEbusBytes([$crc]));
@@ -387,7 +393,7 @@ class VaillantECO305 extends IPSModuleStrict
             'active'           => true,
             'started'          => time(),
             'stage'            => 'wait_start',
-            'key'              => $key,
+            'key'              => $definition['key'],
             'request'          => $master,
             'txWire'           => $txWire,
             'txPos'            => 0,
@@ -400,9 +406,7 @@ class VaillantECO305 extends IPSModuleStrict
             'responseValid'    => false
         ];
         $this->WritePowerState($state);
-        $this->SetValue('PowerReadStatus', $key === 'environmental'
-            ? 'Umweltleistung wird gelesen'
-            : 'Aufnahmeleistung wird gelesen');
+        $this->SetValue('PowerReadStatus', $definition['label'] . ' wird gelesen');
 
         $this->SendEnhanced(0x02, self::OWN_MASTER);
     }
@@ -570,15 +574,13 @@ class VaillantECO305 extends IPSModuleStrict
         $logical = is_array($state['responseLogical'] ?? null) ? $state['responseLogical'] : [];
         $key = (string) ($state['key'] ?? '');
 
-        if ($valid && $this->DecodeActivePowerResponse($key, $logical)) {
+        $definition = $this->FindTelemetryDefinition($key);
+        if ($valid && $definition !== null && $this->DecodeActiveTelemetryResponse($definition, $logical)) {
             $this->SetValue('PowerReadLastResponse', strtoupper(implode(' ', array_map(
                 static fn (int $byte): string => sprintf('%02x', $byte),
                 $logical
             ))));
-            $this->SetValue('PowerReadStatus', $key === 'environmental'
-                ? 'Umweltleistung erfolgreich gelesen'
-                : 'Aufnahmeleistung erfolgreich gelesen');
-            $this->SetBuffer('NextPowerRegister', $key === 'environmental' ? 'consumed' : 'environmental');
+            $this->SetValue('PowerReadStatus', $definition['label'] . ' erfolgreich gelesen');
         } elseif (!$valid) {
             $this->SetValue('PowerReadStatus', 'HMU-Antwort mit ungültiger Prüfsumme');
         }
@@ -587,39 +589,78 @@ class VaillantECO305 extends IPSModuleStrict
     }
 
     /** @param array<int, int> $logical */
-    private function DecodeActivePowerResponse(string $key, array $logical): bool
+    private function DecodeActiveTelemetryResponse(array $definition, array $logical): bool
     {
         if (count($logical) < 5) {
-            $this->SetValue('PowerReadStatus', 'HMU-Antwort enthält keinen Leistungswert');
+            $this->SetValue('PowerReadStatus', 'HMU-Antwort enthält keinen Messwert');
             return false;
         }
 
         // Byte 0 is the slave length; the first three payload bytes are
         // ignored by the official Vaillant HMU definition.
         $payload = array_slice($logical, 4);
-        $value = null;
-        if (count($payload) >= 2) {
-            $raw = $payload[0] | ($payload[1] << 8);
-            $value = $raw / 10.0;
-        } elseif (isset($payload[0])) {
-            $raw = $payload[0] >= 0x80 ? $payload[0] - 0x100 : $payload[0];
-            $value = $raw / 10.0;
-        }
-
-        if ($value === null || $value < 0.0 || $value > 100.0) {
-            $this->SetValue('PowerReadStatus', 'HMU-Leistungswert unplausibel');
+        if (count($payload) < 2) {
+            $this->SetValue('PowerReadStatus', 'HMU-Antwort ist zu kurz');
             return false;
         }
 
-        if ($key === 'environmental') {
-            $this->SetValue('HMUCurrentEnvironmentalPower', $value);
-        } elseif ($key === 'consumed') {
-            $this->SetValue('HMUCurrentConsumedPower', $value);
+        $decoder = (string) $definition['decoder'];
+        if ($decoder === 'd2c') {
+            $raw = $this->Int16LE($payload);
+            $value = $raw === null ? null : $raw / 16.0;
+        } elseif ($decoder === 'sin') {
+            $raw = $this->Int16LE($payload);
+            $value = $raw === null ? null : (float) $raw;
+        } elseif ($decoder === 'uin10') {
+            $raw = $this->UInt16LE($payload);
+            $value = $raw === null ? null : $raw / 10.0;
+        } elseif ($decoder === 'pressure4') {
+            $raw = $this->Int16LE($payload);
+            $value = $raw === null ? null : $raw / 4.0;
         } else {
             return false;
         }
-        $this->UpdateThermalPower();
+
+        $minimum = (float) $definition['minimum'];
+        $maximum = (float) $definition['maximum'];
+        if ($value === null || $value < $minimum || $value > $maximum) {
+            $this->SetValue('PowerReadStatus', $definition['label'] . ': Messwert unplausibel');
+            return false;
+        }
+
+        $this->SetValue((string) $definition['ident'], $value);
+        if (($definition['thermal'] ?? false) === true) {
+            $this->UpdateThermalPower();
+        }
         return true;
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    private function GetTelemetryDefinitions(): array
+    {
+        return [
+            ['key' => 'environmental', 'label' => 'Umweltleistung', 'request' => [0x05, 0x00, 0x32, 0x23], 'ident' => 'HMUCurrentEnvironmentalPower', 'decoder' => 'uin10', 'minimum' => 0, 'maximum' => 100, 'thermal' => true],
+            ['key' => 'consumed', 'label' => 'Aufnahmeleistung', 'request' => [0x05, 0x00, 0x32, 0x24], 'ident' => 'HMUCurrentConsumedPower', 'decoder' => 'uin10', 'minimum' => 0, 'maximum' => 100, 'thermal' => true],
+            ['key' => 'target_hc', 'label' => 'HMU Heizkreis Soll', 'request' => [0x05, 0xFF, 0x32, 0x1C], 'ident' => 'HMUTargetHeatingCircuit', 'decoder' => 'd2c', 'minimum' => -60, 'maximum' => 120],
+            ['key' => 'target_flow', 'label' => 'HMU Vorlauf Soll', 'request' => [0x05, 0x00, 0x32, 0x1F], 'ident' => 'HMUTargetFlow', 'decoder' => 'd2c', 'minimum' => -60, 'maximum' => 120],
+            ['key' => 'flow_temp', 'label' => 'HMU Vorlauf Ist', 'request' => [0x05, 0x00, 0x32, 0x20], 'ident' => 'HMUFlowTemperature', 'decoder' => 'd2c', 'minimum' => -60, 'maximum' => 120],
+            ['key' => 'energy_integral', 'label' => 'HMU Energieintegral', 'request' => [0x05, 0xFF, 0x32, 0x21], 'ident' => 'HMUEnergyIntegral', 'decoder' => 'sin', 'minimum' => -32768, 'maximum' => 32767],
+            ['key' => 'air_intake', 'label' => 'HMU Luftansaugtemperatur', 'request' => [0x05, 0x00, 0x32, 0x26], 'ident' => 'HMUAirIntakeTemperature', 'decoder' => 'd2c', 'minimum' => -60, 'maximum' => 120],
+            ['key' => 'source_output', 'label' => 'HMU Quellentemperatur Ausgang', 'request' => [0x05, 0xFF, 0x32, 0x27], 'ident' => 'HMUSourceOutputTemperature', 'decoder' => 'd2c', 'minimum' => -60, 'maximum' => 120],
+            ['key' => 'flow_pressure', 'label' => 'HMU Anlagendruck', 'request' => [0x05, 0xFF, 0x32, 0x3D], 'ident' => 'HMUFlowPressure', 'decoder' => 'pressure4', 'minimum' => 0, 'maximum' => 100],
+            ['key' => 'source_pressure', 'label' => 'HMU Quelldruck', 'request' => [0x05, 0xFF, 0x32, 0x3E], 'ident' => 'HMUSourcePressure', 'decoder' => 'pressure4', 'minimum' => 0, 'maximum' => 100]
+        ];
+    }
+
+    /** @return array<string, mixed>|null */
+    private function FindTelemetryDefinition(string $key): ?array
+    {
+        foreach ($this->GetTelemetryDefinitions() as $definition) {
+            if ($definition['key'] === $key) {
+                return $definition;
+            }
+        }
+        return null;
     }
 
     private function AbortPowerRead(string $message): void
@@ -1204,7 +1245,7 @@ class VaillantECO305 extends IPSModuleStrict
     /**
      * Normal HMU live monitor (08.hmu.tsp): B5 1A 04 05 counter 32 subId.
      * First three response bytes are ignored by the Vaillant definition.
-     * Handles matching passive traffic and the two whitelisted active reads.
+     * Handles matching passive traffic and the whitelisted active reads.
      *
      * @param array<int, int> $t
      */
@@ -1263,6 +1304,9 @@ class VaillantECO305 extends IPSModuleStrict
                 break;
             case 0x26:
                 $this->SetD2C('HMUAirIntakeTemperature', $payload);
+                break;
+            case 0x27:
+                $this->SetD2C('HMUSourceOutputTemperature', $payload);
                 break;
             case 0x3C:
                 $value = $this->UInt16LE($payload);
