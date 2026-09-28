@@ -102,8 +102,8 @@ class VaillantECO305 extends IPSModuleStrict
         $interval = max(30, $this->ReadPropertyInteger('PowerPollIntervalSeconds'));
         $this->SetTimerInterval('PowerPoll', $enabled ? $interval * 1000 : 0);
         $this->SetSummary($enabled
-            ? 'ECO305 Enhanced - Telemetrie lesen - V1.1'
-            : 'ECO305 Enhanced - passiv - V1.1');
+            ? 'ECO305 Enhanced - Telemetrie lesen - V1.2'
+            : 'ECO305 Enhanced - passiv - V1.2');
 
         $this->SetBuffer('PowerReadState', '');
         $this->SetBuffer('EnhancedRxPartial', '');
@@ -146,7 +146,7 @@ class VaillantECO305 extends IPSModuleStrict
                 ],
                 [
                     'type'    => 'Label',
-                    'caption' => 'Es werden ausschließlich die HMU-Leseregister 32 23 (Umweltleistung) und 32 24 (Aufnahmeleistung) abgefragt. Keine Service-, Test- oder Stellbefehle.'
+                    'caption' => 'Es werden ausschließlich die HMU-Live-Monitor-Leseregister 32 23 (Umweltleistung) und 32 24 (Aufnahmeleistung) abgefragt. Keine Test- oder Stellbefehle.'
                 ]
             ],
             'actions' => [
@@ -366,8 +366,8 @@ class VaillantECO305 extends IPSModuleStrict
         }
         $subId = $key === 'environmental' ? 0x23 : 0x24;
 
-        // Fixed read-only telegram: source 31, HMU 08, B5 1A,
-        // request 05 FF 32 23/24. No caller-supplied raw bytes are accepted.
+        // Fixed read-only live-monitor telegram: source 31, HMU 08, B5 1A,
+        // request 05 00 32 23/24. No caller-supplied raw bytes are accepted.
         $master = [
             self::OWN_MASTER,
             self::HMU_ADDRESS,
@@ -375,7 +375,7 @@ class VaillantECO305 extends IPSModuleStrict
             0x1A,
             0x04,
             0x05,
-            0xFF,
+            0x00,
             0x32,
             $subId
         ];
@@ -454,7 +454,9 @@ class VaillantECO305 extends IPSModuleStrict
 
         if ($stage === 'wait_command_ack') {
             if ($value !== self::EBUS_ACK) {
-                $this->AbortPowerRead('HMU hat die Leseabfrage nicht bestätigt');
+                $this->AbortPowerRead(
+                    'HMU hat die Leseabfrage nicht bestätigt (Antwort ' . sprintf('%02X', $value) . ')'
+                );
                 return;
             }
             $state['stage'] = 'receive_response';
