@@ -41,6 +41,7 @@ class VaillantECO305 extends IPSModuleStrict
         $this->RegisterVariableFloat('HMUFlowTemperature', 'HMU Vorlauf Ist', '~Temperature', 220);
         $this->RegisterVariableFloat('HMUEnergyIntegral', 'HMU Energieintegral', '', 230);
         $this->RegisterVariableFloat('HMUSourceInputTemperature', 'HMU Quellentemperatur Eingang', '~Temperature', 240);
+        $this->RegisterVariableFloat('HMUCurrentEnvironmentalPower', 'HMU aktuelle Umweltleistung [kW]', '', 245);
         $this->RegisterVariableFloat('HMUCurrentYieldPower', 'HMU aktuelle Wärmeleistung [kW]', '', 250);
         $this->RegisterVariableFloat('HMUCurrentConsumedPower', 'HMU aktuelle Aufnahmeleistung [kW]', '', 260);
         $this->RegisterVariableFloat('HMUCompressorUtilization', 'Kompressor Auslastung [%] (nur lesen)', '', 270);
@@ -77,7 +78,7 @@ class VaillantECO305 extends IPSModuleStrict
     public function ApplyChanges(): void
     {
         parent::ApplyChanges();
-        $this->SetSummary('ECO305 Enhanced - nur lesen');
+        $this->SetSummary('ECO305 Enhanced - nur lesen - V0.9');
         $this->EnableArchiveLogging();
     }
 
@@ -203,7 +204,13 @@ class VaillantECO305 extends IPSModuleStrict
                 continue;
             }
 
-            if (($telegram[$p + 1] ?? -1) === 0x24) {
+            if (($telegram[$p + 1] ?? -1) === 0x09) {
+                $this->ProcessB509($telegram, $p);
+            } elseif (($telegram[$p + 1] ?? -1) === 0x11) {
+                $this->ProcessB511($telegram, $p);
+            } elseif (($telegram[$p + 1] ?? -1) === 0x12) {
+                $this->ProcessB512($telegram, $p);
+            } elseif (($telegram[$p + 1] ?? -1) === 0x24) {
                 $this->IncrementDiagnostic('DiagB524Count');
                 $this->ProcessB524($telegram, $p);
             } elseif (($telegram[$p + 1] ?? -1) === 0x14) {
@@ -218,6 +225,97 @@ class VaillantECO305 extends IPSModuleStrict
                 $this->ProcessB51A($telegram, $p);
             }
         }
+    }
+
+    /**
+     * Passive HMU state telegram.
+     * Confirmed on this installation:
+     * B5 11 01 07 ... 0A <compressor modulation percent> ...
+     *
+     * @param array<int, int> $t
+     */
+    private function ProcessB511(array $t, int $p): void
+    {
+        if (($t[$p + 2] ?? -1) !== 0x01 ||
+            ($t[$p + 3] ?? -1) !== 0x07 ||
+            ($t[$p + 6] ?? -1) !== 0x0A ||
+            !isset($t[$p + 7])) {
+            return;
+        }
+
+        $percent = (int) $t[$p + 7];
+        if ($percent < 0 || $percent > 100) {
+            return;
+        }
+
+        $this->SetValue('HMUCompressorUtilization', (float) $percent);
+    }
+
+    /**
+     * Passive hydraulic telegram.
+     * Confirmed on this installation:
+     * B5 12 06 13 <status> <phase 0C..0F> <flow low> <flow high> ...
+     *
+     * @param array<int, int> $t
+     */
+    private function ProcessB512(array $t, int $p): void
+    {
+        if (($t[$p + 2] ?? -1) !== 0x06 ||
+            ($t[$p + 3] ?? -1) !== 0x13 ||
+            !isset($t[$p + 5], $t[$p + 6], $t[$p + 7])) {
+            return;
+        }
+
+        $phase = (int) $t[$p + 5];
+        if (!in_array($phase, [0x0C, 0x0D, 0x0E, 0x0F], true)) {
+            return;
+        }
+
+        $flow = $this->UInt16LE([$t[$p + 6], $t[$p + 7]]);
+        if ($flow === null || $flow < 0 || $flow > 4000) {
+            return;
+        }
+
+        $this->SetValue('HMUBuildingCircuitFlow', (float) $flow);
+    }
+
+    /**
+     * Passive HMU RunData reader. The official HMU definition identifies
+     * 54 02 00 5B 0D as current electrical power in watt (EXP/float LE).
+     * No request is generated; an already present bus response is observed.
+     *
+     * @param array<int, int> $t
+     */
+    private function ProcessB509(array $t, int $p): void
+    {
+        $requestLength = $t[$p + 2] ?? -1;
+        if ($requestLength !== 5 || !isset($t[$p + 7])) {
+            return;
+        }
+
+        $requestID = $this->BytesToHex(array_slice($t, $p + 3, 5));
+        if ($requestID !== '54 02 00 5B 0D') {
+            return;
+        }
+
+        $responseLengthPos = $p + 3 + $requestLength + 2;
+        if (!isset($t[$responseLengthPos])) {
+            return;
+        }
+
+        $responseLength = (int) $t[$responseLengthPos];
+        $responseStart = $responseLengthPos + 1;
+        if ($responseLength < 8 || !isset($t[$responseStart + $responseLength - 1])) {
+            return;
+        }
+
+        $powerW = $this->FloatLE(array_slice($t, $responseStart + 4, 4));
+        if ($powerW === null || !is_finite($powerW) || $powerW < 0 || $powerW > 30000) {
+            return;
+        }
+
+        $this->SetValue('HMUCurrentConsumedPower', $powerW / 1000.0);
+        $this->UpdateThermalPower();
     }
 
     private function IncrementDiagnostic(string $ident): void
@@ -614,13 +712,15 @@ class VaillantECO305 extends IPSModuleStrict
                 $this->SetD2C('HMUSourceInputTemperature', $payload);
                 break;
             case 0x23:
-                $this->SetD1BDiv10('HMUCurrentYieldPower', $payload);
+                $this->SetUIN10('HMUCurrentEnvironmentalPower', $payload);
+                $this->UpdateThermalPower();
                 break;
             case 0x24:
-                $this->SetD1BDiv10('HMUCurrentConsumedPower', $payload);
+                $this->SetUIN10('HMUCurrentConsumedPower', $payload);
+                $this->UpdateThermalPower();
                 break;
             case 0x25:
-                $this->SetD2C('HMUCompressorUtilization', $payload);
+                $this->SetCompressorPercent($payload);
                 break;
             case 0x26:
                 $this->SetD2C('HMUAirIntakeTemperature', $payload);
@@ -702,5 +802,54 @@ class VaillantECO305 extends IPSModuleStrict
         }
         $value = $bytes[0] >= 0x80 ? $bytes[0] - 0x100 : $bytes[0];
         $this->SetValue($ident, $value / 10.0);
+    }
+
+    /** @param array<int, int> $bytes */
+    private function SetUIN10(string $ident, array $bytes): void
+    {
+        $value = $this->UInt16LE($bytes);
+        if ($value === null) {
+            return;
+        }
+        $decoded = $value / 10.0;
+        if ($decoded < 0 || $decoded > 100.0) {
+            return;
+        }
+        $this->SetValue($ident, $decoded);
+    }
+
+    /** @param array<int, int> $bytes */
+    private function SetCompressorPercent(array $bytes): void
+    {
+        if (!isset($bytes[0])) {
+            return;
+        }
+
+        // Current HMU definitions use SCH (one signed byte). Some hardware
+        // variants expose UIN/16 instead, so accept that only as a bounded
+        // fallback. Both paths remain strictly receive-only.
+        $signed = $bytes[0] >= 0x80 ? $bytes[0] - 0x100 : $bytes[0];
+        if ($signed >= 0 && $signed <= 100) {
+            $this->SetValue('HMUCompressorUtilization', (float) $signed);
+            return;
+        }
+
+        $raw = $this->UInt16LE($bytes);
+        if ($raw !== null) {
+            $percent = $raw / 16.0;
+            if ($percent >= 0 && $percent <= 100) {
+                $this->SetValue('HMUCompressorUtilization', $percent);
+            }
+        }
+    }
+
+    private function UpdateThermalPower(): void
+    {
+        $environmental = (float) $this->GetValue('HMUCurrentEnvironmentalPower');
+        $consumed = (float) $this->GetValue('HMUCurrentConsumedPower');
+        $thermal = $environmental + $consumed;
+        if ($thermal >= 0 && $thermal <= 150.0) {
+            $this->SetValue('HMUCurrentYieldPower', $thermal);
+        }
     }
 }
