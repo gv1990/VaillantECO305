@@ -102,8 +102,8 @@ class VaillantECO305 extends IPSModuleStrict
         $interval = max(30, $this->ReadPropertyInteger('PowerPollIntervalSeconds'));
         $this->SetTimerInterval('PowerPoll', $enabled ? $interval * 1000 : 0);
         $this->SetSummary($enabled
-            ? 'ECO305 Enhanced - Telemetrie lesen - V1.2'
-            : 'ECO305 Enhanced - passiv - V1.2');
+            ? 'ECO305 Enhanced - Telemetrie lesen - V1.3'
+            : 'ECO305 Enhanced - passiv - V1.3');
 
         $this->SetBuffer('PowerReadState', '');
         $this->SetBuffer('EnhancedRxPartial', '');
@@ -685,13 +685,15 @@ class VaillantECO305 extends IPSModuleStrict
 
     private function UpdateCrc(int $crc, int $value): int
     {
-        $crc = ($crc ^ $value) & 0xFF;
+        // eBUS does not use the usual table[crc XOR value] order. Its
+        // definition is table[crc] XOR value: first advance the current CRC
+        // with polynomial 0x9B, then combine the next transmitted byte.
         for ($bit = 0; $bit < 8; $bit++) {
             $crc = ($crc & 0x80) !== 0
                 ? (($crc << 1) ^ 0x9B) & 0xFF
                 : ($crc << 1) & 0xFF;
         }
-        return $crc;
+        return ($crc ^ $value) & 0xFF;
     }
 
     /** @param array<int, int> $bytes */
