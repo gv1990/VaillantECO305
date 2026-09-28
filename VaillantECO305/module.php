@@ -102,22 +102,25 @@ class VaillantECO305 extends IPSModuleStrict
         $interval = max(30, $this->ReadPropertyInteger('PowerPollIntervalSeconds'));
         $this->SetTimerInterval('PowerPoll', $enabled ? $interval * 1000 : 0);
         $this->SetSummary($enabled
-            ? 'ECO305 Enhanced - Telemetrie lesen - V1.0'
-            : 'ECO305 Enhanced - passiv - V1.0');
+            ? 'ECO305 Enhanced - Telemetrie lesen - V1.1'
+            : 'ECO305 Enhanced - passiv - V1.1');
 
         $this->SetBuffer('PowerReadState', '');
         $this->SetBuffer('EnhancedRxPartial', '');
         $this->SetBuffer('PassiveFrame', '');
         $this->SetBuffer('PassiveEscape', '0');
         $this->SetBuffer('PassiveSynchronized', '0');
-        $this->SetBuffer('EnhancedInitialized', '0');
+        // The ECO305 connection is already delivering enhanced telegrams.
+        // Some ECO305 firmware does not answer a repeated INIT on an existing
+        // TCP session, therefore active reads start directly on this stream.
+        $this->SetBuffer('EnhancedInitialized', '1');
         if ($this->GetBuffer('NextPowerRegister') === '') {
             $this->SetBuffer('NextPowerRegister', 'environmental');
         }
 
         if ($enabled) {
-            $this->SetValue('PowerReadStatus', 'Initialisierung angefordert');
-            $this->SendEnhanced(0x00, 0x01);
+            $this->SetValue('PowerReadStatus', 'Leistungsabfrage wird gestartet');
+            $this->StartPowerRead();
         } else {
             $this->SetValue('PowerReadStatus', 'Deaktiviert – rein passiver Empfang');
         }
@@ -344,12 +347,6 @@ class VaillantECO305 extends IPSModuleStrict
                 return;
             }
             $this->AbortPowerRead('Vorherige Abfrage nach Zeitüberschreitung verworfen');
-            return;
-        }
-
-        if ($this->GetBuffer('EnhancedInitialized') !== '1') {
-            $this->SetValue('PowerReadStatus', 'ECO305 Initialisierung gesendet');
-            $this->SendEnhanced(0x00, 0x01);
             return;
         }
 
