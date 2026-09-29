@@ -192,7 +192,8 @@ class VaillantECO305 extends IPSModuleStrict
             // High-frequency counters are only for protocol diagnosis and
             // must not fill Archive Control with one entry per telegram.
             if (strncmp($object['ObjectIdent'], 'Diag', 4) === 0 ||
-                strncmp($object['ObjectIdent'], 'PowerRead', 9) === 0) {
+                strncmp($object['ObjectIdent'], 'PowerRead', 9) === 0 ||
+                strncmp($object['ObjectIdent'], 'HeatPumpLoadProfile', 19) === 0) {
                 continue;
             }
 
@@ -639,8 +640,8 @@ class VaillantECO305 extends IPSModuleStrict
     private function GetTelemetryDefinitions(): array
     {
         return [
-            ['key' => 'environmental', 'label' => 'Umweltleistung', 'request' => [0x05, 0x00, 0x32, 0x23], 'ident' => 'HMUCurrentEnvironmentalPower', 'decoder' => 'uin10', 'minimum' => 0, 'maximum' => 100, 'thermal' => true],
-            ['key' => 'consumed', 'label' => 'Aufnahmeleistung', 'request' => [0x05, 0x00, 0x32, 0x24], 'ident' => 'HMUCurrentConsumedPower', 'decoder' => 'uin10', 'minimum' => 0, 'maximum' => 100, 'thermal' => true],
+            ['key' => 'environmental', 'label' => 'Umweltleistung', 'request' => [0x05, 0x00, 0x32, 0x23], 'ident' => 'HMUCurrentEnvironmentalPower', 'decoder' => 'uin10', 'minimum' => 0, 'maximum' => 30, 'thermal' => true],
+            ['key' => 'consumed', 'label' => 'Aufnahmeleistung', 'request' => [0x05, 0x00, 0x32, 0x24], 'ident' => 'HMUCurrentConsumedPower', 'decoder' => 'uin10', 'minimum' => 0, 'maximum' => 30, 'thermal' => true],
             ['key' => 'target_hc', 'label' => 'HMU Heizkreis Soll', 'request' => [0x05, 0xFF, 0x32, 0x1C], 'ident' => 'HMUTargetHeatingCircuit', 'decoder' => 'd2c', 'minimum' => -60, 'maximum' => 120],
             ['key' => 'target_flow', 'label' => 'HMU Vorlauf Soll', 'request' => [0x05, 0x00, 0x32, 0x1F], 'ident' => 'HMUTargetFlow', 'decoder' => 'd2c', 'minimum' => -60, 'maximum' => 120],
             ['key' => 'flow_temp', 'label' => 'HMU Vorlauf Ist', 'request' => [0x05, 0x00, 0x32, 0x20], 'ident' => 'HMUFlowTemperature', 'decoder' => 'd2c', 'minimum' => -60, 'maximum' => 120],
@@ -1372,9 +1373,16 @@ class VaillantECO305 extends IPSModuleStrict
     private function SetD2C(string $ident, array $bytes): void
     {
         $value = $this->Int16LE($bytes);
-        if ($value !== null) {
-            $this->SetValue($ident, $value / 16.0);
+        if ($value === null) {
+            return;
         }
+        $decoded = $value / 16.0;
+        // Reject eBUS replacement/error values (for example about -1005 °C)
+        // before they can be written to and archived by IP-Symcon.
+        if ($decoded < -60.0 || $decoded > 120.0) {
+            return;
+        }
+        $this->SetValue($ident, $decoded);
     }
 
     /** @param array<int, int> $bytes */
@@ -1402,7 +1410,9 @@ class VaillantECO305 extends IPSModuleStrict
             return;
         }
         $decoded = $value / 10.0;
-        if ($decoded < 0 || $decoded > 100.0) {
+        // 30 kW is deliberately a generous plausibility ceiling for this
+        // installation. It rejects known replacement values around 78 kW.
+        if ($decoded < 0 || $decoded > 30.0) {
             return;
         }
         $this->SetValue($ident, $decoded);
@@ -1435,10 +1445,36 @@ class VaillantECO305 extends IPSModuleStrict
 
     private function UpdateThermalPower(): void
     {
-        $environmental = (float) $this->GetValue('HMUCurrentEnvironmentalPower');
-        $consumed = (float) $this->GetValue('HMUCurrentConsumedPower');
+        $environmentalID = @IPS_GetObjectIDByIdent('HMUCurrentEnvironmentalPower', $this->InstanceID);
+        $consumedID = @IPS_GetObjectIDByIdent('HMUCurrentConsumedPower', $this->InstanceID);
+        if ($environmentalID === false || $consumedID === false) {
+            return;
+        }
+
+        $environmentalInfo = IPS_GetVariable($environmentalID);
+        $consumedInfo = IPS_GetVariable($consumedID);
+        $environmentalUpdated = (int) ($environmentalInfo['VariableUpdated'] ?? 0);
+        $consumedUpdated = (int) ($consumedInfo['VariableUpdated'] ?? 0);
+        $now = time();
+
+        // Never combine a fresh register with an old value from another poll.
+        if (
+            $environmentalUpdated <= 0
+            || $consumedUpdated <= 0
+            || ($now - $environmentalUpdated) > 120
+            || ($now - $consumedUpdated) > 120
+            || abs($environmentalUpdated - $consumedUpdated) > 120
+        ) {
+            return;
+        }
+
+        $environmental = (float) GetValue($environmentalID);
+        $consumed = (float) GetValue($consumedID);
+        if ($environmental < 0 || $environmental > 30.0 || $consumed < 0 || $consumed > 30.0) {
+            return;
+        }
         $thermal = $environmental + $consumed;
-        if ($thermal >= 0 && $thermal <= 150.0) {
+        if ($thermal >= 0 && $thermal <= 30.0) {
             $this->SetValue('HMUCurrentYieldPower', $thermal);
         }
     }
