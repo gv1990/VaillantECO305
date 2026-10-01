@@ -103,17 +103,21 @@ class VaillantECO305 extends IPSModuleStrict
         $this->RegisterVariableString('PowerReadLastResponse', 'HMU-Leseabfrage letzte Antwort', '', 1050);
         $this->RegisterVariableString('PowerReadLastRequest', 'Leseabfrage gesendete Anforderung', '', 1060);
         $this->RegisterVariableString('PowerReadTrace', 'Leseabfrage Diagnoseablauf', '', 1070);
+
+        // Passive safety diagnostic used to identify already occupied eBUS
+        // source addresses before any further active request is considered.
+        $this->RegisterVariableString('DiagObservedSources', 'Diagnose: Passiv beobachtete eBUS-Absender', '', 1080);
+        $this->RegisterAttributeString('DiagObservedSourcesJSON', '{}');
     }
 
     public function ApplyChanges(): void
     {
         parent::ApplyChanges();
-        $enabled = $this->ReadPropertyBoolean('EnableActivePowerPolling');
-        $interval = max(30, $this->ReadPropertyInteger('PowerPollIntervalSeconds'));
-        $this->SetTimerInterval('PowerPoll', $enabled ? $interval * 1000 : 0);
-        $this->SetSummary($enabled
-            ? 'ECO305 Enhanced - Telemetrie lesen - V1.4'
-            : 'ECO305 Enhanced - passiv - V1.4');
+        // Safety lock for build 20: address 31 was already observed on this
+        // installation. Do not originate any telegram until occupied source
+        // addresses have been established passively.
+        $this->SetTimerInterval('PowerPoll', 0);
+        $this->SetSummary('ECO305 Enhanced - passive Adressdiagnose - V1.4');
 
         $this->SetBuffer('PowerReadState', '');
         $this->SetBuffer('EnhancedRxPartial', '');
@@ -138,12 +142,7 @@ class VaillantECO305 extends IPSModuleStrict
             }
         }
 
-        if ($enabled) {
-            $this->SetValue('PowerReadStatus', 'HMU-Leseabfrage wird gestartet');
-            $this->StartPowerRead();
-        } else {
-            $this->SetValue('PowerReadStatus', 'Deaktiviert – rein passiver Empfang');
-        }
+        $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – nur passive Adressdiagnose');
         $this->EnableArchiveLogging();
     }
 
@@ -152,35 +151,15 @@ class VaillantECO305 extends IPSModuleStrict
         return json_encode([
             'elements' => [
                 [
-                    'type'    => 'CheckBox',
-                    'name'    => 'EnableActivePowerPolling',
-                    'caption' => 'HMU-Telemetrie aktiv abfragen (ausschließlich lesen)'
-                ],
-                [
-                    'type'    => 'NumberSpinner',
-                    'name'    => 'PowerPollIntervalSeconds',
-                    'caption' => 'Abfrageintervall je Register (Sekunden)',
-                    'minimum' => 30,
-                    'maximum' => 3600,
-                    'suffix'  => ' s'
+                    'type'    => 'Label',
+                    'caption' => 'Build 20 arbeitet ausschließlich passiv. Aktive Leseabfragen sind wegen einer möglichen Kollision der eBUS-Adresse 31 vorübergehend gesperrt.'
                 ],
                 [
                     'type'    => 'Label',
-                    'caption' => 'Es werden ausschließlich fest hinterlegte Nur-Lese-Register abgefragt. Keine frei eingebbaren Telegramme, keine Test- oder Stellbefehle.'
+                    'caption' => 'Unter den Statusvariablen zeigt „Diagnose: Passiv beobachtete eBUS-Absender“ alle vollständig empfangenen Absender mit Anzahl und Zeitstempel.'
                 ]
             ],
-            'actions' => [
-                [
-                    'type'    => 'Button',
-                    'caption' => 'HMU-Leseabfrage jetzt starten',
-                    'onClick' => 'VECO_PollPower($id);'
-                ],
-                [
-                    'type'    => 'Button',
-                    'caption' => 'Heizkurve jetzt lesen (nur lesen)',
-                    'onClick' => 'VECO_PollHeatingCurve($id);'
-                ]
-            ]
+            'actions' => []
         ], JSON_THROW_ON_ERROR);
     }
 
@@ -286,10 +265,7 @@ class VaillantECO305 extends IPSModuleStrict
         if ($command === self::ENH_RES_RESETTED) {
             $this->SetBuffer('PowerReadState', '');
             $this->SetBuffer('EnhancedInitialized', '1');
-            $this->SetValue('PowerReadStatus', 'ECO305 initialisiert');
-            if ($this->ReadPropertyBoolean('EnableActivePowerPolling')) {
-                $this->StartPowerRead();
-            }
+            $this->SetValue('PowerReadStatus', 'ECO305 initialisiert – passive Sicherheitssperre bleibt aktiv');
             return;
         }
 
@@ -356,45 +332,16 @@ class VaillantECO305 extends IPSModuleStrict
         $this->SetBuffer('PassiveFrame', $frameHex);
     }
 
-    /** Start one whitelisted, read-only HMU telemetry request. */
+    /** Build 20 safety lock: do not start an active HMU request. */
     public function PollPower(): void
     {
-        if (!$this->ReadPropertyBoolean('EnableActivePowerPolling')) {
-            return;
-        }
-
-        $state = $this->ReadPowerState();
-        if (($state['active'] ?? false) === true) {
-            $started = (int) ($state['started'] ?? 0);
-            if ($started > 0 && (time() - $started) <= 15) {
-                return;
-            }
-            $this->AbortPowerRead('Vorherige Abfrage nach Zeitüberschreitung verworfen');
-            return;
-        }
-
-        $this->StartPowerRead();
+        $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – aktive Abfrage nicht gesendet');
     }
 
-    /** Start exactly one fixed, read-only B5-24 heating-curve query. */
+    /** Build 20 safety lock: do not start an active heating-curve request. */
     public function PollHeatingCurve(): void
     {
-        $state = $this->ReadPowerState();
-        if (($state['active'] ?? false) === true) {
-            $started = (int) ($state['started'] ?? 0);
-            if ($started > 0 && (time() - $started) <= 15) {
-                $this->SetValue('PowerReadStatus', 'Andere Leseabfrage läuft – gleich erneut versuchen');
-                return;
-            }
-            $this->AbortPowerRead('Vorherige Abfrage nach Zeitüberschreitung verworfen');
-        }
-
-        $definition = $this->FindTelemetryDefinition('heating_curve');
-        if ($definition === null) {
-            $this->SetValue('PowerReadStatus', 'Heizkurven-Leseregister nicht gefunden');
-            return;
-        }
-        $this->StartPowerRead($definition);
+        $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – Heizkurvenabfrage nicht gesendet');
     }
 
     /** @param array<string, mixed>|null $forcedDefinition */
@@ -899,6 +846,8 @@ class VaillantECO305 extends IPSModuleStrict
     /** @param array<int, int> $telegram */
     private function ProcessTelegram(array $telegram): void
     {
+        $this->UpdateObservedSourceDiagnostic($telegram);
+
         $count = count($telegram);
         for ($p = 0; $p <= $count - 3; $p++) {
             if ($telegram[$p] !== 0xB5) {
@@ -928,6 +877,65 @@ class VaillantECO305 extends IPSModuleStrict
                 $this->ProcessB51A($telegram, $p);
             }
         }
+    }
+
+    /**
+     * Record only the source address of structurally complete passive master
+     * telegrams. This routine never sends data to the eBUS.
+     *
+     * @param array<int, int> $telegram
+     */
+    private function UpdateObservedSourceDiagnostic(array $telegram): void
+    {
+        if (count($telegram) < 6 || !isset($telegram[0], $telegram[1], $telegram[4])) {
+            return;
+        }
+
+        $payloadLength = (int) $telegram[4];
+        if ($payloadLength < 0 || $payloadLength > 32 || count($telegram) < 6 + $payloadLength) {
+            return;
+        }
+
+        $source = sprintf('%02X', (int) $telegram[0]);
+        $destination = sprintf('%02X', (int) $telegram[1]);
+        $entries = json_decode($this->ReadAttributeString('DiagObservedSourcesJSON'), true);
+        if (!is_array($entries)) {
+            $entries = [];
+        }
+
+        $now = date('d.m.Y H:i:s');
+        $entry = isset($entries[$source]) && is_array($entries[$source]) ? $entries[$source] : [
+            'count' => 0,
+            'first' => $now,
+            'last' => $now,
+            'destination' => $destination,
+            'example' => ''
+        ];
+        $entry['count'] = (int) ($entry['count'] ?? 0) + 1;
+        $entry['last'] = $now;
+        $entry['destination'] = $destination;
+        $entry['example'] = $this->BytesToHex(array_slice($telegram, 0, min(12, count($telegram))));
+        $entries[$source] = $entry;
+        ksort($entries, SORT_STRING);
+
+        $this->WriteAttributeString('DiagObservedSourcesJSON', json_encode($entries, JSON_THROW_ON_ERROR));
+
+        $lines = [];
+        foreach ($entries as $address => $data) {
+            if (!is_array($data)) {
+                continue;
+            }
+            $lines[] = sprintf(
+                '%s = %dx | zuerst %s | zuletzt %s | letztes Ziel %s | Beispiel %s',
+                $address,
+                (int) ($data['count'] ?? 0),
+                (string) ($data['first'] ?? '-'),
+                (string) ($data['last'] ?? '-'),
+                (string) ($data['destination'] ?? '-'),
+                (string) ($data['example'] ?? '')
+            );
+        }
+        $this->SetValue('DiagObservedSources', implode("\n", $lines));
     }
 
     /**
