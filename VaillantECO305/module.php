@@ -1127,24 +1127,32 @@ class VaillantECO305 extends IPSModuleStrict
             return;
         }
 
-        $responseLengthPos = $p + 3 + $requestLength + 2;
-        if (!isset($t[$responseLengthPos])) {
-            return;
-        }
-        $responseLength = (int) $t[$responseLengthPos];
-        $responseStart = $responseLengthPos + 1;
-        if ($responseLength < 0 || $responseLength > 64) {
-            return;
-        }
-        if ($responseLength > 0 && !isset($t[$responseStart + $responseLength - 1])) {
-            return;
-        }
-
         $id = str_replace(' ', '', $this->BytesToHex($request));
-        $response = array_slice($t, $responseStart, $responseLength);
-        $payload = $responseLength > 4 ? array_slice($response, 4) : [];
-        $responseHex = $this->BytesToHex($response);
-        $payloadHex = $this->BytesToHex($payload);
+        // Keep everything following the six request bytes. This also covers
+        // passive/master frames that do not contain the paired response layout
+        // used by the older capture script.
+        $rawTail = array_slice($t, $p + 3 + $requestLength);
+        $rawTailHex = $this->BytesToHex($rawTail);
+
+        // Decode the response only when this concrete frame actually contains
+        // the familiar CRC/ACK + length + response arrangement.
+        $responseHex = '';
+        $payloadHex = '';
+        $responseLengthPos = $p + 3 + $requestLength + 2;
+        if (isset($t[$responseLengthPos])) {
+            $responseLength = (int) $t[$responseLengthPos];
+            $responseStart = $responseLengthPos + 1;
+            if (
+                $responseLength >= 0
+                && $responseLength <= 64
+                && ($responseLength === 0 || isset($t[$responseStart + $responseLength - 1]))
+            ) {
+                $response = array_slice($t, $responseStart, $responseLength);
+                $payload = $responseLength > 4 ? array_slice($response, 4) : [];
+                $responseHex = $this->BytesToHex($response);
+                $payloadHex = $this->BytesToHex($payload);
+            }
+        }
 
         $stored = json_decode($this->ReadAttributeString('DiagB524TypesJSON'), true);
         if (!is_array($stored)) {
@@ -1154,12 +1162,13 @@ class VaillantECO305 extends IPSModuleStrict
             return;
         }
 
-        $previousPayload = isset($stored[$id]['payload']) ? (string) $stored[$id]['payload'] : null;
+        $previousRaw = isset($stored[$id]['raw']) ? (string) $stored[$id]['raw'] : null;
         $seen = isset($stored[$id]['seen']) ? (int) $stored[$id]['seen'] + 1 : 1;
-        $changed = $previousPayload !== null && $previousPayload !== $payloadHex;
+        $changed = $previousRaw !== null && $previousRaw !== $rawTailHex;
         $stored[$id] = [
             'seen' => $seen,
             'time' => time(),
+            'raw' => $rawTailHex,
             'response' => $responseHex,
             'payload' => $payloadHex
         ];
@@ -1177,8 +1186,8 @@ class VaillantECO305 extends IPSModuleStrict
             $changes[] = [
                 'time' => time(),
                 'id' => $id,
-                'old' => $previousPayload,
-                'new' => $payloadHex
+                'old' => $previousRaw,
+                'new' => $rawTailHex
             ];
             if (count($changes) > 80) {
                 $changes = array_slice($changes, -80);
@@ -1198,10 +1207,11 @@ class VaillantECO305 extends IPSModuleStrict
         $lines = [];
         foreach ($stored as $storedID => $entry) {
             $lines[] = sprintf(
-                '%s = %dx | %s | Payload %s | Response %s',
+                '%s = %dx | %s | Rest %s | Payload %s | Response %s',
                 $storedID,
                 (int) ($entry['seen'] ?? 0),
                 isset($entry['time']) ? date('d.m.Y H:i:s', (int) $entry['time']) : '-',
+                (string) ($entry['raw'] ?? ''),
                 (string) ($entry['payload'] ?? ''),
                 (string) ($entry['response'] ?? '')
             );
