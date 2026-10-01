@@ -70,6 +70,12 @@ class VaillantECO305 extends IPSModuleStrict
 
         // Passive protocol diagnostics. Deliberately not archived.
         $this->RegisterVariableInteger('DiagB524Count', 'Diagnose: B5-24 Telegramme gesehen', '', 900);
+        $this->RegisterVariableString('DiagLastB524Hex', 'Diagnose: Letztes B5-24 Telegramm', '', 902);
+        $this->RegisterVariableString('DiagB524Types', 'Diagnose: B5-24 IDs und Antworten', '', 904);
+        $this->RegisterVariableInteger('DiagB524ChangeCount', 'Diagnose: B5-24 Nutzdaten-Änderungen', '', 906);
+        $this->RegisterVariableString('DiagB524Changes', 'Diagnose: B5-24 geänderte Nutzdaten', '', 908);
+        $this->RegisterAttributeString('DiagB524TypesJSON', '{}');
+        $this->RegisterAttributeString('DiagB524ChangesJSON', '{}');
         $this->RegisterVariableInteger('DiagB51ACount', 'Diagnose: B5-1A Telegramme gesehen', '', 910);
         $this->RegisterVariableString('DiagLastB51AHex', 'Diagnose: Letztes B5-1A Telegramm', '', 920);
         $this->RegisterVariableString('DiagB51ATypes', 'Diagnose: B5-1A Requesttypen', '', 930);
@@ -793,6 +799,8 @@ class VaillantECO305 extends IPSModuleStrict
                 $this->ProcessB512($telegram, $p);
             } elseif (($telegram[$p + 1] ?? -1) === 0x24) {
                 $this->IncrementDiagnostic('DiagB524Count');
+                $this->SetValue('DiagLastB524Hex', $this->BytesToHex($telegram));
+                $this->UpdateB524TypeDiagnostic($telegram, $p);
                 $this->ProcessB524($telegram, $p);
             } elseif (($telegram[$p + 1] ?? -1) === 0x14) {
                 $this->IncrementDiagnostic('DiagB514Count');
@@ -1098,6 +1106,126 @@ class VaillantECO305 extends IPSModuleStrict
             );
         }
         $this->SetValue('DiagB51AChanges', implode("\n", $lines));
+    }
+
+    /**
+     * Record the real six-byte B5-24 parameter IDs and their payload changes.
+     * This is receive-only diagnosis; no request or control telegram is sent.
+     * The lists are bounded to avoid unbounded instance-state growth.
+     *
+     * @param array<int, int> $t
+     */
+    private function UpdateB524TypeDiagnostic(array $t, int $p): void
+    {
+        $requestLength = $t[$p + 2] ?? -1;
+        if ($requestLength !== 6 || !isset($t[$p + 8])) {
+            return;
+        }
+
+        $request = array_slice($t, $p + 3, 6);
+        if (count($request) !== 6) {
+            return;
+        }
+
+        $responseLengthPos = $p + 3 + $requestLength + 2;
+        if (!isset($t[$responseLengthPos])) {
+            return;
+        }
+        $responseLength = (int) $t[$responseLengthPos];
+        $responseStart = $responseLengthPos + 1;
+        if ($responseLength < 0 || $responseLength > 64) {
+            return;
+        }
+        if ($responseLength > 0 && !isset($t[$responseStart + $responseLength - 1])) {
+            return;
+        }
+
+        $id = str_replace(' ', '', $this->BytesToHex($request));
+        $response = array_slice($t, $responseStart, $responseLength);
+        $payload = $responseLength > 4 ? array_slice($response, 4) : [];
+        $responseHex = $this->BytesToHex($response);
+        $payloadHex = $this->BytesToHex($payload);
+
+        $stored = json_decode($this->ReadAttributeString('DiagB524TypesJSON'), true);
+        if (!is_array($stored)) {
+            $stored = [];
+        }
+        if (!isset($stored[$id]) && count($stored) >= 64) {
+            return;
+        }
+
+        $previousPayload = isset($stored[$id]['payload']) ? (string) $stored[$id]['payload'] : null;
+        $seen = isset($stored[$id]['seen']) ? (int) $stored[$id]['seen'] + 1 : 1;
+        $changed = $previousPayload !== null && $previousPayload !== $payloadHex;
+        $stored[$id] = [
+            'seen' => $seen,
+            'time' => time(),
+            'response' => $responseHex,
+            'payload' => $payloadHex
+        ];
+
+        $json = json_encode($stored);
+        if (is_string($json)) {
+            $this->WriteAttributeString('DiagB524TypesJSON', $json);
+        }
+
+        if ($changed) {
+            $changes = json_decode($this->ReadAttributeString('DiagB524ChangesJSON'), true);
+            if (!is_array($changes)) {
+                $changes = [];
+            }
+            $changes[] = [
+                'time' => time(),
+                'id' => $id,
+                'old' => $previousPayload,
+                'new' => $payloadHex
+            ];
+            if (count($changes) > 80) {
+                $changes = array_slice($changes, -80);
+            }
+            $changesJson = json_encode($changes);
+            if (is_string($changesJson)) {
+                $this->WriteAttributeString('DiagB524ChangesJSON', $changesJson);
+            }
+            $this->SetValue(
+                'DiagB524ChangeCount',
+                (int) $this->GetValue('DiagB524ChangeCount') + 1
+            );
+            $this->RenderB524Changes($changes);
+        }
+
+        ksort($stored, SORT_STRING);
+        $lines = [];
+        foreach ($stored as $storedID => $entry) {
+            $lines[] = sprintf(
+                '%s = %dx | %s | Payload %s | Response %s',
+                $storedID,
+                (int) ($entry['seen'] ?? 0),
+                isset($entry['time']) ? date('d.m.Y H:i:s', (int) $entry['time']) : '-',
+                (string) ($entry['payload'] ?? ''),
+                (string) ($entry['response'] ?? '')
+            );
+        }
+        $this->SetValue('DiagB524Types', implode("\n", $lines));
+    }
+
+    /** @param array<int, array<string, mixed>> $changes */
+    private function RenderB524Changes(array $changes): void
+    {
+        $lines = [];
+        foreach ($changes as $entry) {
+            if (!is_array($entry)) {
+                continue;
+            }
+            $lines[] = sprintf(
+                '%s | ID %s | ALT %s | NEU %s',
+                isset($entry['time']) ? date('d.m.Y H:i:s', (int) $entry['time']) : '-',
+                (string) ($entry['id'] ?? ''),
+                (string) ($entry['old'] ?? ''),
+                (string) ($entry['new'] ?? '')
+            );
+        }
+        $this->SetValue('DiagB524Changes', implode("\n", $lines));
     }
 
     /**
