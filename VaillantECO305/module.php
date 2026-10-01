@@ -124,6 +124,10 @@ class VaillantECO305 extends IPSModuleStrict
         $this->SetBuffer('PassiveFrame', '');
         $this->SetBuffer('PassiveEscape', '0');
         $this->SetBuffer('PassiveSynchronized', '0');
+        // Build 21 applies stricter address and CRC validation. Discard the
+        // unvalidated Build-20 observations once when this build is applied.
+        $this->WriteAttributeString('DiagObservedSourcesJSON', '{}');
+        $this->SetValue('DiagObservedSources', 'Warte auf vollständig empfangene Telegramme mit gültiger CRC');
         // The ECO305 connection is already delivering enhanced telegrams.
         // Some ECO305 firmware does not answer a repeated INIT on an existing
         // TCP session, therefore active reads start directly on this stream.
@@ -152,7 +156,7 @@ class VaillantECO305 extends IPSModuleStrict
             'elements' => [
                 [
                     'type'    => 'Label',
-                    'caption' => 'Build 20 arbeitet ausschließlich passiv. Aktive Leseabfragen sind wegen einer möglichen Kollision der eBUS-Adresse 31 vorübergehend gesperrt.'
+                    'caption' => 'Build 21 arbeitet ausschließlich passiv. Aktive Leseabfragen sind wegen einer möglichen Kollision der eBUS-Adresse 31 vorübergehend gesperrt.'
                 ],
                 [
                     'type'    => 'Label',
@@ -332,13 +336,13 @@ class VaillantECO305 extends IPSModuleStrict
         $this->SetBuffer('PassiveFrame', $frameHex);
     }
 
-    /** Build 20 safety lock: do not start an active HMU request. */
+    /** Build 21 safety lock: do not start an active HMU request. */
     public function PollPower(): void
     {
         $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – aktive Abfrage nicht gesendet');
     }
 
-    /** Build 20 safety lock: do not start an active heating-curve request. */
+    /** Build 21 safety lock: do not start an active heating-curve request. */
     public function PollHeatingCurve(): void
     {
         $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – Heizkurvenabfrage nicht gesendet');
@@ -891,12 +895,26 @@ class VaillantECO305 extends IPSModuleStrict
             return;
         }
 
-        $payloadLength = (int) $telegram[4];
-        if ($payloadLength < 0 || $payloadLength > 32 || count($telegram) < 6 + $payloadLength) {
+        $sourceByte = (int) $telegram[0];
+        $allowedMasterNibbles = [0x0, 0x1, 0x3, 0x7, 0xF];
+        if (!in_array($sourceByte & 0x0F, $allowedMasterNibbles, true) ||
+            !in_array(($sourceByte >> 4) & 0x0F, $allowedMasterNibbles, true)) {
             return;
         }
 
-        $source = sprintf('%02X', (int) $telegram[0]);
+        $payloadLength = (int) $telegram[4];
+        $crcPosition = 5 + $payloadLength;
+        if ($payloadLength < 0 || $payloadLength > 16 || !isset($telegram[$crcPosition])) {
+            return;
+        }
+
+        $masterData = array_slice($telegram, 0, $crcPosition);
+        $calculatedCrc = $this->CalculateCrc($this->EscapeEbusBytes($masterData));
+        if ($calculatedCrc !== (int) $telegram[$crcPosition]) {
+            return;
+        }
+
+        $source = sprintf('%02X', $sourceByte);
         $destination = sprintf('%02X', (int) $telegram[1]);
         $entries = json_decode($this->ReadAttributeString('DiagObservedSourcesJSON'), true);
         if (!is_array($entries)) {
