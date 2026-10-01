@@ -30,6 +30,7 @@ class VaillantECO305 extends IPSModuleStrict
     private const EBUS_NAK = 0xFF;
     private const OWN_MASTER = 0x31;
     private const HMU_ADDRESS = 0x08;
+    private const CONTROLLER_ADDRESS = 0x15;
 
     public function Create(): void
     {
@@ -163,7 +164,7 @@ class VaillantECO305 extends IPSModuleStrict
                 ],
                 [
                     'type'    => 'Label',
-                    'caption' => 'Es werden ausschließlich fest hinterlegte offizielle HMU-Leseregister abgefragt. Keine frei eingebbaren Telegramme, keine Test- oder Stellbefehle.'
+                    'caption' => 'Es werden ausschließlich fest hinterlegte Nur-Lese-Register abgefragt. Keine frei eingebbaren Telegramme, keine Test- oder Stellbefehle.'
                 ]
             ],
             'actions' => [
@@ -171,6 +172,11 @@ class VaillantECO305 extends IPSModuleStrict
                     'type'    => 'Button',
                     'caption' => 'HMU-Leseabfrage jetzt starten',
                     'onClick' => 'VECO_PollPower($id);'
+                ],
+                [
+                    'type'    => 'Button',
+                    'caption' => 'Heizkurve jetzt lesen (nur lesen)',
+                    'onClick' => 'VECO_PollHeatingCurve($id);'
                 ]
             ]
         ], JSON_THROW_ON_ERROR);
@@ -368,30 +374,71 @@ class VaillantECO305 extends IPSModuleStrict
         $this->StartPowerRead();
     }
 
-    private function StartPowerRead(): void
+    /** Start exactly one fixed, read-only B5-24 heating-curve query. */
+    public function PollHeatingCurve(): void
+    {
+        $state = $this->ReadPowerState();
+        if (($state['active'] ?? false) === true) {
+            $started = (int) ($state['started'] ?? 0);
+            if ($started > 0 && (time() - $started) <= 15) {
+                $this->SetValue('PowerReadStatus', 'Andere Leseabfrage läuft – gleich erneut versuchen');
+                return;
+            }
+            $this->AbortPowerRead('Vorherige Abfrage nach Zeitüberschreitung verworfen');
+        }
+
+        $definition = $this->FindTelemetryDefinition('heating_curve');
+        if ($definition === null) {
+            $this->SetValue('PowerReadStatus', 'Heizkurven-Leseregister nicht gefunden');
+            return;
+        }
+        $this->StartPowerRead($definition);
+    }
+
+    /** @param array<string, mixed>|null $forcedDefinition */
+    private function StartPowerRead(?array $forcedDefinition = null): void
     {
         $current = $this->ReadPowerState();
         if (($current['active'] ?? false) === true) {
             return;
         }
 
-        $definitions = $this->GetTelemetryDefinitions();
-        $queueIndex = (int) $this->GetBuffer('TelemetryQueueIndex');
-        if ($queueIndex < 0 || $queueIndex >= count($definitions)) {
-            $queueIndex = 0;
+        if ($forcedDefinition !== null) {
+            $definition = $forcedDefinition;
+        } else {
+            $definitions = array_values(array_filter(
+                $this->GetTelemetryDefinitions(),
+                static fn (array $item): bool => ($item['manualOnly'] ?? false) !== true
+            ));
+            $queueIndex = (int) $this->GetBuffer('TelemetryQueueIndex');
+            if ($queueIndex < 0 || $queueIndex >= count($definitions)) {
+                $queueIndex = 0;
+            }
+            $definition = $definitions[$queueIndex];
+            $this->SetBuffer('TelemetryQueueIndex', (string) (($queueIndex + 1) % count($definitions)));
         }
-        $definition = $definitions[$queueIndex];
-        $this->SetBuffer('TelemetryQueueIndex', (string) (($queueIndex + 1) % count($definitions)));
 
-        // Fixed read-only telegram: source 31, HMU 08, B5 1A followed by
-        // one whitelisted official request. No caller-supplied bytes exist.
-        $master = array_merge([
-            self::OWN_MASTER,
-            self::HMU_ADDRESS,
-            0xB5,
-            0x1A,
-            0x04
-        ], $definition['request']);
+        // Fixed whitelisted read-only telegram. No caller-supplied address,
+        // command or payload exists. B5-1A reads HMU telemetry at 08; B5-24
+        // reads the heating curve from the controller at 15.
+        $protocol = (string) ($definition['protocol'] ?? 'b51a');
+        if ($protocol === 'b524') {
+            $master = array_merge([
+                self::OWN_MASTER,
+                self::CONTROLLER_ADDRESS,
+                0xB5,
+                0x24,
+                0x06
+            ], $definition['request']);
+        } else {
+            $master = array_merge([
+                self::OWN_MASTER,
+                self::HMU_ADDRESS,
+                0xB5,
+                0x1A,
+                0x04
+            ], $definition['request']);
+        }
         $masterWire = $this->EscapeEbusBytes($master);
         $crc = $this->CalculateCrc($masterWire);
         $txWire = array_merge(array_slice($masterWire, 1), $this->EscapeEbusBytes([$crc]));
@@ -598,20 +645,22 @@ class VaillantECO305 extends IPSModuleStrict
     /** @param array<int, int> $logical */
     private function DecodeActiveTelemetryResponse(array $definition, array $logical): bool
     {
-        if (count($logical) < 5) {
+        $payloadOffset = (int) ($definition['payloadOffset'] ?? 4);
+        if (count($logical) <= $payloadOffset) {
             $this->SetValue('PowerReadStatus', 'HMU-Antwort enthält keinen Messwert');
             return false;
         }
 
-        // Byte 0 is the slave length; the first three payload bytes are
-        // ignored by the official Vaillant HMU definition.
-        $payload = array_slice($logical, 4);
-        if (count($payload) < 2) {
+        // Byte 0 is the slave length. The register definition fixes how many
+        // response/header bytes precede the value.
+        $payload = array_slice($logical, $payloadOffset);
+        $decoder = (string) $definition['decoder'];
+        $minimumBytes = $decoder === 'exp' ? 4 : 2;
+        if (count($payload) < $minimumBytes) {
             $this->SetValue('PowerReadStatus', 'HMU-Antwort ist zu kurz');
             return false;
         }
 
-        $decoder = (string) $definition['decoder'];
         if ($decoder === 'd2c') {
             $raw = $this->Int16LE($payload);
             $value = $raw === null ? null : $raw / 16.0;
@@ -624,6 +673,8 @@ class VaillantECO305 extends IPSModuleStrict
         } elseif ($decoder === 'pressure4') {
             $raw = $this->Int16LE($payload);
             $value = $raw === null ? null : $raw / 4.0;
+        } elseif ($decoder === 'exp') {
+            $value = $this->FloatLE($payload);
         } else {
             return false;
         }
@@ -655,7 +706,8 @@ class VaillantECO305 extends IPSModuleStrict
             ['key' => 'air_intake', 'label' => 'HMU Luftansaugtemperatur', 'request' => [0x05, 0x00, 0x32, 0x26], 'ident' => 'HMUAirIntakeTemperature', 'decoder' => 'd2c', 'minimum' => -60, 'maximum' => 120],
             ['key' => 'source_output', 'label' => 'HMU Quellentemperatur Ausgang', 'request' => [0x05, 0xFF, 0x32, 0x27], 'ident' => 'HMUSourceOutputTemperature', 'decoder' => 'd2c', 'minimum' => -60, 'maximum' => 120],
             ['key' => 'flow_pressure', 'label' => 'HMU Anlagendruck', 'request' => [0x05, 0xFF, 0x32, 0x3D], 'ident' => 'HMUFlowPressure', 'decoder' => 'pressure4', 'minimum' => 0, 'maximum' => 100],
-            ['key' => 'source_pressure', 'label' => 'HMU Quelldruck', 'request' => [0x05, 0xFF, 0x32, 0x3E], 'ident' => 'HMUSourcePressure', 'decoder' => 'pressure4', 'minimum' => 0, 'maximum' => 100]
+            ['key' => 'source_pressure', 'label' => 'HMU Quelldruck', 'request' => [0x05, 0xFF, 0x32, 0x3E], 'ident' => 'HMUSourcePressure', 'decoder' => 'pressure4', 'minimum' => 0, 'maximum' => 100],
+            ['key' => 'heating_curve', 'label' => 'Heizkurve HK1', 'protocol' => 'b524', 'manualOnly' => true, 'request' => [0x02, 0x00, 0x02, 0x00, 0x0F, 0x00], 'payloadOffset' => 5, 'ident' => 'HeatingCurve1', 'decoder' => 'exp', 'minimum' => 0, 'maximum' => 5]
         ];
     }
 
