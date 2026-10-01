@@ -101,6 +101,8 @@ class VaillantECO305 extends IPSModuleStrict
 
         $this->RegisterVariableString('PowerReadStatus', 'HMU-Leseabfrage Status', '', 1040);
         $this->RegisterVariableString('PowerReadLastResponse', 'HMU-Leseabfrage letzte Antwort', '', 1050);
+        $this->RegisterVariableString('PowerReadLastRequest', 'Leseabfrage gesendete Anforderung', '', 1060);
+        $this->RegisterVariableString('PowerReadTrace', 'Leseabfrage Diagnoseablauf', '', 1070);
     }
 
     public function ApplyChanges(): void
@@ -460,6 +462,15 @@ class VaillantECO305 extends IPSModuleStrict
             'responseValid'    => false
         ];
         $this->WritePowerState($state);
+        $this->SetValue('PowerReadLastRequest', $this->BytesToHex(array_merge($master, [$crc])));
+        $this->SetValue('PowerReadTrace', '');
+        $this->TracePowerRead(sprintf(
+            'START %s | Protokoll %s | Anforderung %s | Sendedaten %s',
+            (string) $definition['key'],
+            $protocol,
+            $this->BytesToHex(array_merge($master, [$crc])),
+            $this->BytesToHex($txWire)
+        ));
         $this->SetValue('PowerReadStatus', $definition['label'] . ' wird gelesen');
 
         $this->SendEnhanced(0x02, self::OWN_MASTER);
@@ -473,11 +484,21 @@ class VaillantECO305 extends IPSModuleStrict
         }
 
         if ($command === self::ENH_RES_FAILED) {
+            $this->TracePowerReadState('ECO305 BUSZUGRIFF BELEGT', $state, $command, $value);
             $this->AbortPowerRead('Buszugriff belegt – nächster Versuch folgt');
             return;
         }
         if ($command === self::ENH_RES_ERROR_EBUS || $command === self::ENH_RES_ERROR_HOST) {
-            $this->AbortPowerRead('ECO305 Kommunikationsfehler ' . sprintf('%02X', $value));
+            $errorName = $command === self::ENH_RES_ERROR_HOST ? 'ERROR_HOST' : 'ERROR_EBUS';
+            $this->TracePowerReadState('ECO305 ' . $errorName, $state, $command, $value);
+            $this->AbortPowerRead(sprintf(
+                'ECO305 Kommunikationsfehler %02X | %s | Stufe %s | Sendeposition %d/%d',
+                $value,
+                $errorName,
+                (string) ($state['stage'] ?? '-'),
+                (int) ($state['txPos'] ?? 0),
+                is_array($state['txWire'] ?? null) ? count($state['txWire']) : 0
+            ));
             return;
         }
 
@@ -486,6 +507,7 @@ class VaillantECO305 extends IPSModuleStrict
             if ($command !== self::ENH_RES_STARTED || $value !== self::OWN_MASTER) {
                 return;
             }
+            $this->TracePowerRead('ARBITRIERUNG ERFOLGREICH | Master ' . sprintf('%02X', $value));
             $state['stage'] = 'send_master';
             $this->SendNextPowerByte($state);
             return;
@@ -512,11 +534,13 @@ class VaillantECO305 extends IPSModuleStrict
 
         if ($stage === 'wait_command_ack') {
             if ($value !== self::EBUS_ACK) {
+                $this->TracePowerReadState('ZIEL NICHT BESTÄTIGT', $state, $command, $value);
                 $this->AbortPowerRead(
                     'HMU hat die Leseabfrage nicht bestätigt (Antwort ' . sprintf('%02X', $value) . ')'
                 );
                 return;
             }
+            $this->TracePowerRead('ZIEL BESTÄTIGT | ACK 00 | Antwort wird gelesen');
             $state['stage'] = 'receive_response';
             $this->WritePowerState($state);
             return;
@@ -540,6 +564,7 @@ class VaillantECO305 extends IPSModuleStrict
         }
 
         if ($stage === 'send_syn' && $value === self::EBUS_SYN) {
+            $this->TracePowerRead('TRANSAKTION BEENDET | SYN AA');
             $this->CompletePowerRead($state);
         }
     }
@@ -578,6 +603,13 @@ class VaillantECO305 extends IPSModuleStrict
             }
 
             $valid = $decodedCrc === (int) $state['responseCrc'];
+            $this->TracePowerRead(sprintf(
+                'ANTWORT VOLLSTÄNDIG | Daten %s | CRC empfangen %02X | CRC berechnet %02X | %s',
+                $this->BytesToHex($logical),
+                $decodedCrc,
+                (int) $state['responseCrc'],
+                $valid ? 'gültig' : 'ungültig'
+            ));
             $state['responseValid'] = $valid;
             $state['stage'] = 'send_response_ack';
             $state['lastSent'] = $valid ? self::EBUS_ACK : self::EBUS_NAK;
@@ -736,6 +768,36 @@ class VaillantECO305 extends IPSModuleStrict
             // the mandatory eBUS synchronisation symbol, not a device command.
             $this->SendEnhanced($stage === 'wait_start' ? 0x02 : 0x01, self::EBUS_SYN);
         }
+    }
+
+    private function TracePowerReadState(string $message, array $state, int $command, int $value): void
+    {
+        $this->TracePowerRead(sprintf(
+            '%s | Kommando %02X | Wert %02X | Stufe %s | Sendeposition %d/%d | Letztes Byte %02X | Antwort %s | CRC-Bytes %s',
+            $message,
+            $command,
+            $value,
+            (string) ($state['stage'] ?? '-'),
+            (int) ($state['txPos'] ?? 0),
+            is_array($state['txWire'] ?? null) ? count($state['txWire']) : 0,
+            ((int) ($state['lastSent'] ?? -1)) & 0xFF,
+            is_array($state['responseLogical'] ?? null) ? $this->BytesToHex($state['responseLogical']) : '',
+            is_array($state['responseCrcBytes'] ?? null) ? $this->BytesToHex($state['responseCrcBytes']) : ''
+        ));
+    }
+
+    private function TracePowerRead(string $message): void
+    {
+        $current = trim((string) $this->GetValue('PowerReadTrace'));
+        $lines = $current === '' ? [] : preg_split('/\R/', $current);
+        if (!is_array($lines)) {
+            $lines = [];
+        }
+        $lines[] = date('d.m.Y H:i:s') . ' | ' . $message;
+        if (count($lines) > 40) {
+            $lines = array_slice($lines, -40);
+        }
+        $this->SetValue('PowerReadTrace', implode("\n", $lines));
     }
 
     /** @return array<string, mixed> */
