@@ -112,11 +112,11 @@ class VaillantECO305 extends IPSModuleStrict
     public function ApplyChanges(): void
     {
         parent::ApplyChanges();
-        // Build 23 keeps every automatic read disabled. Only the explicit,
-        // one-shot heating-curve read and the arbitration-only FF probe in
-        // the configuration form are available.
+        // Build 24 keeps every automatic read disabled. The explicit one-shot
+        // heating-curve read is armed first and starts only at the next
+        // passively observed SYN bus boundary.
         $this->SetTimerInterval('PowerPoll', 0);
-        $this->SetSummary('ECO305 Enhanced - Heizkurve einmalig lesen mit FF - V1.4');
+        $this->SetSummary('ECO305 Enhanced - Heizkurve an SYN-Grenze einmalig lesen - V1.4');
 
         $this->SetBuffer('PowerReadState', '');
         $this->SetBuffer('EnhancedRxPartial', '');
@@ -141,7 +141,7 @@ class VaillantECO305 extends IPSModuleStrict
             }
         }
 
-        $this->SetValue('PowerReadStatus', 'Automatik gesperrt – nur manuelle Heizkurven-Leseabfrage mit FF verfügbar');
+        $this->SetValue('PowerReadStatus', 'Automatik gesperrt – manuelle Heizkurven-Leseabfrage wartet zuerst auf SYN AA');
         $this->EnableArchiveLogging();
     }
 
@@ -151,7 +151,7 @@ class VaillantECO305 extends IPSModuleStrict
             'elements' => [
                 [
                     'type'    => 'Label',
-                    'caption' => 'Build 23 lässt ausschließlich eine manuell ausgelöste, fest vorgegebene B5-24-Leseabfrage der Heizkurve mit Masteradresse FF zu. Keine Automatik, keine Wiederholung und kein Schreibtelegramm.'
+                    'caption' => 'Build 24 merkt die manuelle, fest vorgegebene B5-24-Heizkurvenabfrage zunächst nur vor. Gesendet wird erst unmittelbar nach der nächsten passiv beobachteten Busgrenze SYN AA. Keine Automatik, keine Wiederholung und kein Schreibtelegramm.'
                 ],
                 [
                     'type'    => 'Label',
@@ -161,7 +161,7 @@ class VaillantECO305 extends IPSModuleStrict
             'actions' => [
                 [
                     'type'    => 'Button',
-                    'caption' => 'Heizkurve mit FF genau einmal lesen (nur lesen)',
+                    'caption' => 'Heizkurve an nächster SYN-Grenze einmal lesen (nur lesen)',
                     'onClick' => 'VECO_PollHeatingCurve($id);'
                 ],
                 [
@@ -310,6 +310,7 @@ class VaillantECO305 extends IPSModuleStrict
             $this->SetBuffer('PassiveFrame', '');
             $this->SetBuffer('PassiveEscape', '0');
             $this->SetBuffer('PassiveSynchronized', '1');
+            $this->StartArmedHeatingCurveAtSyn();
             return;
         }
 
@@ -342,7 +343,7 @@ class VaillantECO305 extends IPSModuleStrict
         $this->SetBuffer('PassiveFrame', $frameHex);
     }
 
-    /** Build 23 safety lock: active HMU requests remain unavailable. */
+    /** Build 24 safety lock: active HMU requests remain unavailable. */
     public function PollPower(): void
     {
         $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – aktive Abfrage nicht gesendet');
@@ -424,7 +425,7 @@ class VaillantECO305 extends IPSModuleStrict
             'active'           => true,
             'mode'             => 'heating_curve_read',
             'started'          => time(),
-            'stage'            => 'wait_start',
+            'stage'            => 'wait_bus_syn',
             'key'              => $definition['key'],
             'request'          => $master,
             'txWire'           => $txWire,
@@ -441,14 +442,29 @@ class VaillantECO305 extends IPSModuleStrict
         $this->SetValue('PowerReadLastRequest', $this->BytesToHex(array_merge($master, [$crc])));
         $this->SetValue('PowerReadTrace', '');
         $this->TracePowerRead(sprintf(
-            'START %s | Protokoll %s | Anforderung %s | Sendedaten %s',
+            'VORGEMERKT %s | wartet passiv auf SYN AA | Protokoll %s | Anforderung %s | Sendedaten %s',
             (string) $definition['key'],
             'b524',
             $this->BytesToHex(array_merge($master, [$crc])),
             $this->BytesToHex($txWire)
         ));
-        $this->SetValue('PowerReadStatus', $definition['label'] . ' wird gelesen');
+        $this->SetValue('PowerReadStatus', 'Heizkurven-Leseabfrage vorgemerkt – wartet passiv auf nächstes SYN AA');
+    }
 
+    private function StartArmedHeatingCurveAtSyn(): void
+    {
+        $state = $this->ReadPowerState();
+        if (($state['active'] ?? false) !== true ||
+            ($state['mode'] ?? '') !== 'heating_curve_read' ||
+            ($state['stage'] ?? '') !== 'wait_bus_syn') {
+            return;
+        }
+
+        $state['stage'] = 'wait_start';
+        $state['started'] = time();
+        $this->WritePowerState($state);
+        $this->SetValue('PowerReadStatus', 'SYN-AA-Busgrenze erkannt – Arbitrierung FF gestartet');
+        $this->TracePowerRead('BUSGRENZE ERKANNT | SYN AA | START Arbitrierung Master FF');
         $this->SendEnhanced(0x02, self::PROBE_MASTER);
     }
 
@@ -456,6 +472,13 @@ class VaillantECO305 extends IPSModuleStrict
     {
         $state = $this->ReadPowerState();
         if (($state['active'] ?? false) !== true) {
+            return;
+        }
+
+        // No command has been sent while merely waiting for a passive SYN.
+        // Any adapter error seen in this stage belongs to unrelated traffic
+        // and must neither abort nor trigger the armed one-shot read.
+        if (($state['stage'] ?? '') === 'wait_bus_syn') {
             return;
         }
 
