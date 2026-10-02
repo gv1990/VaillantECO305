@@ -7,7 +7,7 @@ declare(strict_types=1);
  *
  * SAFETY DESIGN:
  * - Passive decoding remains enabled for all existing values.
- * - Build 25 centrally blocks every active eBUS transmission.
+ * - Build 26 centrally blocks every active eBUS transmission.
  * - No EnableTest messages.
  * - No compressor, pump, valve, service or safety commands.
  * - No caller-controlled raw messages and no configuration action buttons.
@@ -77,6 +77,7 @@ class VaillantECO305 extends IPSModuleStrict
         $this->RegisterVariableString('DiagB524Changes', 'Diagnose: B5-24 geänderte Nutzdaten', '', 908);
         $this->RegisterAttributeString('DiagB524TypesJSON', '{}');
         $this->RegisterAttributeString('DiagB524ChangesJSON', '{}');
+        $this->RegisterAttributeInteger('B524ValidationSchema', 0);
         $this->RegisterVariableInteger('DiagB51ACount', 'Diagnose: B5-1A Telegramme gesehen', '', 910);
         $this->RegisterVariableString('DiagLastB51AHex', 'Diagnose: Letztes B5-1A Telegramm', '', 920);
         $this->RegisterVariableString('DiagB51ATypes', 'Diagnose: B5-1A Requesttypen', '', 930);
@@ -113,10 +114,11 @@ class VaillantECO305 extends IPSModuleStrict
     public function ApplyChanges(): void
     {
         parent::ApplyChanges();
-        // Build 25 is strictly passive. Timers, manual actions and the final
-        // socket send path are all locked against active eBUS traffic.
+        // Build 26 is strictly passive. Timers, manual actions and the final
+        // socket send path are all locked against active eBUS traffic. B5-24
+        // decoding additionally requires a fully CRC-valid transaction.
         $this->SetTimerInterval('PowerPoll', 0);
-        $this->SetSummary('ECO305 Enhanced - ausschließlich passiv - V1.4');
+        $this->SetSummary('ECO305 Enhanced - passiv, B5-24 CRC-geprüft - V1.4');
 
         $this->SetBuffer('PowerReadState', '');
         $this->SetBuffer('EnhancedRxPartial', '');
@@ -127,6 +129,19 @@ class VaillantECO305 extends IPSModuleStrict
         // Start a fresh observation window whenever this build is applied.
         $this->WriteAttributeString('DiagObservedSourcesJSON', '{}');
         $this->SetValue('DiagObservedSources', 'Warte auf vollständig empfangene Telegramme mit gültiger CRC');
+        // Build 25 admitted incomplete B5-24 fragments. Reset those legacy
+        // diagnostics exactly once when upgrading to the strict Build-26
+        // validation schema; ordinary reconnects must retain clean captures.
+        if ($this->ReadAttributeInteger('B524ValidationSchema') < 26) {
+            $this->WriteAttributeString('DiagB524TypesJSON', '{}');
+            $this->WriteAttributeString('DiagB524ChangesJSON', '{}');
+            $this->SetValue('DiagB524Count', 0);
+            $this->SetValue('DiagLastB524Hex', 'Warte auf vollständige B5-24-Transaktion mit gültiger CRC');
+            $this->SetValue('DiagB524Types', 'Warte auf vollständige B5-24-Transaktion mit gültiger CRC');
+            $this->SetValue('DiagB524ChangeCount', 0);
+            $this->SetValue('DiagB524Changes', 'Noch keine CRC-validierte B5-24-Nutzdatenänderung');
+            $this->WriteAttributeInteger('B524ValidationSchema', 26);
+        }
         // The ECO305 connection is already delivering enhanced telegrams.
         // Some ECO305 firmware does not answer a repeated INIT on an existing
         // TCP session, therefore active reads start directly on this stream.
@@ -134,14 +149,14 @@ class VaillantECO305 extends IPSModuleStrict
         // These legacy placeholders have no confirmed register on this plant.
         // Keep the objects for upgrade compatibility, but do not present a
         // permanent "Nie" as though it were a failed measurement.
-        foreach (['SystemFlowTemperature', 'HotWaterFlow', 'HeatingCircuit1Flow', 'HMUSourceInputTemperature'] as $ident) {
+        foreach (['SystemFlowTemperature', 'HotWaterFlow', 'HeatingCircuit1Flow', 'HeatingCurve1', 'HMUSourceInputTemperature'] as $ident) {
             $objectID = @IPS_GetObjectIDByIdent($ident, $this->InstanceID);
             if ($objectID !== false) {
                 IPS_SetHidden($objectID, true);
             }
         }
 
-        $this->SetValue('PowerReadStatus', 'Build 25 passiv – sämtliche aktiven eBUS-Abfragen gesperrt');
+        $this->SetValue('PowerReadStatus', 'Build 26 passiv – aktive Abfragen gesperrt; B5-24 nur CRC-validiert');
         $this->EnableArchiveLogging();
     }
 
@@ -151,7 +166,7 @@ class VaillantECO305 extends IPSModuleStrict
             'elements' => [
                 [
                     'type'    => 'Label',
-                    'caption' => 'Build 25 arbeitet ausschließlich passiv. Es gibt keine Geräteabfrage, keine Arbitrierung, keine Wiederholung und kein Schreibtelegramm.'
+                    'caption' => 'Build 26 arbeitet ausschließlich passiv. B5-24 wird nur bei vollständiger Transaktion mit gültiger Master- und Antwort-CRC ausgewertet. Es gibt keine Geräteabfrage, keine Arbitrierung, keine Wiederholung und kein Schreibtelegramm.'
                 ],
                 [
                     'type'    => 'Label',
@@ -264,7 +279,7 @@ class VaillantECO305 extends IPSModuleStrict
         if ($command === self::ENH_RES_RESETTED) {
             $this->SetBuffer('PowerReadState', '');
             $this->SetBuffer('EnhancedInitialized', '1');
-            $this->SetValue('PowerReadStatus', 'ECO305 initialisiert – Build 25 bleibt vollständig passiv');
+            $this->SetValue('PowerReadStatus', 'ECO305 initialisiert – Build 26 bleibt vollständig passiv');
             return;
         }
 
@@ -331,16 +346,16 @@ class VaillantECO305 extends IPSModuleStrict
         $this->SetBuffer('PassiveFrame', $frameHex);
     }
 
-    /** Build 25 safety lock: active HMU requests are unavailable. */
+    /** Build 26 safety lock: active HMU requests are unavailable. */
     public function PollPower(): void
     {
         $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – aktive Abfrage nicht gesendet');
     }
 
-    /** Build 25 safety lock: active heating-curve reads are unavailable. */
+    /** Build 26 safety lock: active heating-curve reads are unavailable. */
     public function PollHeatingCurve(): void
     {
-        $this->SetValue('PowerReadStatus', 'Build 25 passiv – Heizkurvenabfrage nicht gesendet');
+        $this->SetValue('PowerReadStatus', 'Build 26 passiv – Heizkurvenabfrage nicht gesendet');
     }
 
     /**
@@ -350,7 +365,7 @@ class VaillantECO305 extends IPSModuleStrict
      */
     public function ProbeMasterAddress(): void
     {
-        $this->SetValue('PowerReadStatus', 'Build 25 passiv – Arbitrierungstest nicht gesendet');
+        $this->SetValue('PowerReadStatus', 'Build 26 passiv – Arbitrierungstest nicht gesendet');
     }
 
     private function StartHeatingCurveRead(): void
@@ -878,7 +893,7 @@ class VaillantECO305 extends IPSModuleStrict
     private function SendEnhanced(int $command, int $value): void
     {
         if (!self::ACTIVE_TRAFFIC_ALLOWED) {
-            $this->SetValue('PowerReadStatus', 'Build 25 passiv – zentrale Sendesperre aktiv');
+            $this->SetValue('PowerReadStatus', 'Build 26 passiv – zentrale Sendesperre aktiv');
             $this->SetBuffer('PowerReadState', '');
             return;
         }
@@ -916,6 +931,12 @@ class VaillantECO305 extends IPSModuleStrict
             } elseif (($telegram[$p + 1] ?? -1) === 0x12) {
                 $this->ProcessB512($telegram, $p);
             } elseif (($telegram[$p + 1] ?? -1) === 0x24) {
+                // Never interpret a nested or truncated B5-24 byte sequence.
+                // Only the protocol position of a complete, CRC-valid eBUS
+                // request/response transaction is admitted.
+                if (!$this->IsValidB524Transaction($telegram, $p)) {
+                    continue;
+                }
                 $this->IncrementDiagnostic('DiagB524Count');
                 $this->SetValue('DiagLastB524Hex', $this->BytesToHex($telegram));
                 $this->UpdateB524TypeDiagnostic($telegram, $p);
@@ -932,6 +953,64 @@ class VaillantECO305 extends IPSModuleStrict
                 $this->ProcessB51A($telegram, $p);
             }
         }
+    }
+
+    /**
+     * Accept only a complete B5-24 request/response transaction:
+     * master request + master CRC + target ACK + response length/data +
+     * response CRC + master ACK. The passive buffer already contains logical
+     * (unescaped) bytes, therefore CRC calculation re-applies eBUS escaping.
+     *
+     * @param array<int, int> $telegram
+     */
+    private function IsValidB524Transaction(array $telegram, int $protocolPosition): bool
+    {
+        // In a real master frame source and destination precede B5 24.
+        if ($protocolPosition !== 2 || count($telegram) < 13 ||
+            ($telegram[2] ?? -1) !== 0xB5 ||
+            ($telegram[3] ?? -1) !== 0x24) {
+            return false;
+        }
+
+        $requestLength = (int) ($telegram[4] ?? -1);
+        if ($requestLength !== 6) {
+            return false;
+        }
+
+        $masterCrcPosition = 5 + $requestLength;
+        $targetAckPosition = $masterCrcPosition + 1;
+        $responseLengthPosition = $targetAckPosition + 1;
+        if (!isset(
+            $telegram[$masterCrcPosition],
+            $telegram[$targetAckPosition],
+            $telegram[$responseLengthPosition]
+        )) {
+            return false;
+        }
+
+        $masterBytes = array_slice($telegram, 0, $masterCrcPosition);
+        $masterCrc = $this->CalculateCrc($this->EscapeEbusBytes($masterBytes));
+        if ($masterCrc !== (int) $telegram[$masterCrcPosition] ||
+            (int) $telegram[$targetAckPosition] !== self::EBUS_ACK) {
+            return false;
+        }
+
+        $responseLength = (int) $telegram[$responseLengthPosition];
+        if ($responseLength < 1 || $responseLength > 32) {
+            return false;
+        }
+
+        $responseStart = $responseLengthPosition + 1;
+        $responseCrcPosition = $responseStart + $responseLength;
+        $masterAckPosition = $responseCrcPosition + 1;
+        if (!isset($telegram[$responseCrcPosition], $telegram[$masterAckPosition])) {
+            return false;
+        }
+
+        $responseBytes = array_slice($telegram, $responseLengthPosition, 1 + $responseLength);
+        $responseCrc = $this->CalculateCrc($this->EscapeEbusBytes($responseBytes));
+        return $responseCrc === (int) $telegram[$responseCrcPosition]
+            && (int) $telegram[$masterAckPosition] === self::EBUS_ACK;
     }
 
     /**
