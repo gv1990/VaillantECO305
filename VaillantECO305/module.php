@@ -7,10 +7,10 @@ declare(strict_types=1);
  *
  * SAFETY DESIGN:
  * - Passive decoding remains enabled for all existing values.
- * - Optional active traffic is restricted to hard-coded official HMU reads.
+ * - Optional active traffic is restricted to one fixed heating-curve read.
  * - No EnableTest messages.
  * - No compressor, pump, valve, service or safety commands.
- * - No caller-controlled raw messages; all read telegrams are whitelisted.
+ * - No caller-controlled raw messages; the single read telegram is whitelisted.
  * - All module status variables are logged locally by IP-Symcon Archive Control.
  *
  * ECO305 mode: Enhanced, TCP server.
@@ -28,9 +28,7 @@ class VaillantECO305 extends IPSModuleStrict
     private const EBUS_SYN = 0xAA;
     private const EBUS_ACK = 0x00;
     private const EBUS_NAK = 0xFF;
-    private const OWN_MASTER = 0x31;
     private const PROBE_MASTER = 0xFF;
-    private const HMU_ADDRESS = 0x08;
     private const CONTROLLER_ADDRESS = 0x15;
 
     public function Create(): void
@@ -114,10 +112,11 @@ class VaillantECO305 extends IPSModuleStrict
     public function ApplyChanges(): void
     {
         parent::ApplyChanges();
-        // Build 22 keeps all device reads disabled. Only the explicit,
-        // arbitration-only FF probe in the configuration form is available.
+        // Build 23 keeps every automatic read disabled. Only the explicit,
+        // one-shot heating-curve read and the arbitration-only FF probe in
+        // the configuration form are available.
         $this->SetTimerInterval('PowerPoll', 0);
-        $this->SetSummary('ECO305 Enhanced - Adresstest FF ohne Geräteabfrage - V1.4');
+        $this->SetSummary('ECO305 Enhanced - Heizkurve einmalig lesen mit FF - V1.4');
 
         $this->SetBuffer('PowerReadState', '');
         $this->SetBuffer('EnhancedRxPartial', '');
@@ -132,10 +131,6 @@ class VaillantECO305 extends IPSModuleStrict
         // Some ECO305 firmware does not answer a repeated INIT on an existing
         // TCP session, therefore active reads start directly on this stream.
         $this->SetBuffer('EnhancedInitialized', '1');
-        if ($this->GetBuffer('TelemetryQueueIndex') === '') {
-            $this->SetBuffer('TelemetryQueueIndex', '0');
-        }
-
         // These legacy placeholders have no confirmed register on this plant.
         // Keep the objects for upgrade compatibility, but do not present a
         // permanent "Nie" as though it were a failed measurement.
@@ -146,7 +141,7 @@ class VaillantECO305 extends IPSModuleStrict
             }
         }
 
-        $this->SetValue('PowerReadStatus', 'Geräteabfragen gesperrt – nur Arbitrierungstest FF verfügbar');
+        $this->SetValue('PowerReadStatus', 'Automatik gesperrt – nur manuelle Heizkurven-Leseabfrage mit FF verfügbar');
         $this->EnableArchiveLogging();
     }
 
@@ -156,7 +151,7 @@ class VaillantECO305 extends IPSModuleStrict
             'elements' => [
                 [
                     'type'    => 'Label',
-                    'caption' => 'Build 22 sperrt weiterhin alle Geräteabfragen. Der optionale Test prüft ausschließlich die Arbitrierung mit Masteradresse FF und gibt den Bus sofort wieder frei.'
+                    'caption' => 'Build 23 lässt ausschließlich eine manuell ausgelöste, fest vorgegebene B5-24-Leseabfrage der Heizkurve mit Masteradresse FF zu. Keine Automatik, keine Wiederholung und kein Schreibtelegramm.'
                 ],
                 [
                     'type'    => 'Label',
@@ -164,6 +159,11 @@ class VaillantECO305 extends IPSModuleStrict
                 ]
             ],
             'actions' => [
+                [
+                    'type'    => 'Button',
+                    'caption' => 'Heizkurve mit FF genau einmal lesen (nur lesen)',
+                    'onClick' => 'VECO_PollHeatingCurve($id);'
+                ],
                 [
                     'type'    => 'Button',
                     'caption' => 'Buszugriff mit FF einmal prüfen (keine Geräteabfrage)',
@@ -275,7 +275,7 @@ class VaillantECO305 extends IPSModuleStrict
         if ($command === self::ENH_RES_RESETTED) {
             $this->SetBuffer('PowerReadState', '');
             $this->SetBuffer('EnhancedInitialized', '1');
-            $this->SetValue('PowerReadStatus', 'ECO305 initialisiert – Geräteabfragen bleiben gesperrt');
+            $this->SetValue('PowerReadStatus', 'ECO305 initialisiert – Automatik bleibt gesperrt');
             return;
         }
 
@@ -342,16 +342,16 @@ class VaillantECO305 extends IPSModuleStrict
         $this->SetBuffer('PassiveFrame', $frameHex);
     }
 
-    /** Build 22 safety lock: do not start an active HMU request. */
+    /** Build 23 safety lock: active HMU requests remain unavailable. */
     public function PollPower(): void
     {
         $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – aktive Abfrage nicht gesendet');
     }
 
-    /** Build 22 safety lock: do not start an active heating-curve request. */
+    /** Start the single fixed, manual-only heating-curve read. */
     public function PollHeatingCurve(): void
     {
-        $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – Heizkurvenabfrage nicht gesendet');
+        $this->StartHeatingCurveRead();
     }
 
     /**
@@ -391,56 +391,38 @@ class VaillantECO305 extends IPSModuleStrict
         $this->SendEnhanced(0x02, self::PROBE_MASTER);
     }
 
-    /** @param array<string, mixed>|null $forcedDefinition */
-    private function StartPowerRead(?array $forcedDefinition = null): void
+    private function StartHeatingCurveRead(): void
     {
         $current = $this->ReadPowerState();
         if (($current['active'] ?? false) === true) {
+            $this->SetValue('PowerReadStatus', 'Anderer Protokollvorgang läuft – Heizkurve nicht erneut abgefragt');
             return;
         }
 
-        if ($forcedDefinition !== null) {
-            $definition = $forcedDefinition;
-        } else {
-            $definitions = array_values(array_filter(
-                $this->GetTelemetryDefinitions(),
-                static fn (array $item): bool => ($item['manualOnly'] ?? false) !== true
-            ));
-            $queueIndex = (int) $this->GetBuffer('TelemetryQueueIndex');
-            if ($queueIndex < 0 || $queueIndex >= count($definitions)) {
-                $queueIndex = 0;
-            }
-            $definition = $definitions[$queueIndex];
-            $this->SetBuffer('TelemetryQueueIndex', (string) (($queueIndex + 1) % count($definitions)));
+        $definition = $this->FindTelemetryDefinition('heating_curve');
+        if ($definition === null ||
+            ($definition['protocol'] ?? '') !== 'b524' ||
+            ($definition['request'] ?? null) !== [0x02, 0x00, 0x02, 0x00, 0x0F, 0x00]) {
+            $this->SetValue('PowerReadStatus', 'Interne Sicherheitsprüfung fehlgeschlagen – nichts gesendet');
+            return;
         }
 
-        // Fixed whitelisted read-only telegram. No caller-supplied address,
-        // command or payload exists. B5-1A reads HMU telemetry at 08; B5-24
-        // reads the heating curve from the controller at 15.
-        $protocol = (string) ($definition['protocol'] ?? 'b51a');
-        if ($protocol === 'b524') {
-            $master = array_merge([
-                self::OWN_MASTER,
-                self::CONTROLLER_ADDRESS,
-                0xB5,
-                0x24,
-                0x06
-            ], $definition['request']);
-        } else {
-            $master = array_merge([
-                self::OWN_MASTER,
-                self::HMU_ADDRESS,
-                0xB5,
-                0x1A,
-                0x04
-            ], $definition['request']);
-        }
+        // Fixed whitelist: FF -> controller 15, B5 24 read key
+        // 02 00 02 00 0F 00. No caller-controlled byte is accepted here.
+        $master = array_merge([
+            self::PROBE_MASTER,
+            self::CONTROLLER_ADDRESS,
+            0xB5,
+            0x24,
+            0x06
+        ], $definition['request']);
         $masterWire = $this->EscapeEbusBytes($master);
         $crc = $this->CalculateCrc($masterWire);
         $txWire = array_merge(array_slice($masterWire, 1), $this->EscapeEbusBytes([$crc]));
 
         $state = [
             'active'           => true,
+            'mode'             => 'heating_curve_read',
             'started'          => time(),
             'stage'            => 'wait_start',
             'key'              => $definition['key'],
@@ -461,13 +443,13 @@ class VaillantECO305 extends IPSModuleStrict
         $this->TracePowerRead(sprintf(
             'START %s | Protokoll %s | Anforderung %s | Sendedaten %s',
             (string) $definition['key'],
-            $protocol,
+            'b524',
             $this->BytesToHex(array_merge($master, [$crc])),
             $this->BytesToHex($txWire)
         ));
         $this->SetValue('PowerReadStatus', $definition['label'] . ' wird gelesen');
 
-        $this->SendEnhanced(0x02, self::OWN_MASTER);
+        $this->SendEnhanced(0x02, self::PROBE_MASTER);
     }
 
     private function HandlePowerProtocolEvent(int $command, int $value): void
@@ -484,7 +466,8 @@ class VaillantECO305 extends IPSModuleStrict
                 $this->SetBuffer('PowerReadState', '');
                 return;
             }
-            $this->AbortPowerRead('Buszugriff belegt – nächster Versuch folgt');
+            $this->SetValue('PowerReadStatus', 'Buszugriff belegt – Heizkurve nicht abgefragt; keine Wiederholung');
+            $this->SetBuffer('PowerReadState', '');
             return;
         }
         if ($command === self::ENH_RES_ERROR_EBUS || $command === self::ENH_RES_ERROR_HOST) {
@@ -499,21 +482,20 @@ class VaillantECO305 extends IPSModuleStrict
                 $this->SetBuffer('PowerReadState', '');
                 return;
             }
-            $this->AbortPowerRead(sprintf(
-                'ECO305 Kommunikationsfehler %02X | %s | Stufe %s | Sendeposition %d/%d',
-                $value,
+            $this->SetValue('PowerReadStatus', sprintf(
+                'Heizkurven-Leseabfrage abgebrochen | %s %02X | Stufe %s | keine Wiederholung',
                 $errorName,
-                (string) ($state['stage'] ?? '-'),
-                (int) ($state['txPos'] ?? 0),
-                is_array($state['txWire'] ?? null) ? count($state['txWire']) : 0
+                $value,
+                (string) ($state['stage'] ?? '-')
             ));
+            $this->SetBuffer('PowerReadState', '');
             return;
         }
 
         $stage = (string) ($state['stage'] ?? '');
         if ($stage === 'wait_start') {
             $isAddressProbe = ($state['mode'] ?? '') === 'address_probe';
-            $expectedMaster = $isAddressProbe ? self::PROBE_MASTER : self::OWN_MASTER;
+            $expectedMaster = self::PROBE_MASTER;
             if ($command !== self::ENH_RES_STARTED || $value !== $expectedMaster) {
                 return;
             }
@@ -566,7 +548,7 @@ class VaillantECO305 extends IPSModuleStrict
             if ($value !== self::EBUS_ACK) {
                 $this->TracePowerReadState('ZIEL NICHT BESTÄTIGT', $state, $command, $value);
                 $this->AbortPowerRead(
-                    'HMU hat die Leseabfrage nicht bestätigt (Antwort ' . sprintf('%02X', $value) . ')'
+                    'Regler hat die Heizkurven-Leseabfrage nicht bestätigt (Antwort ' . sprintf('%02X', $value) . ')'
                 );
                 return;
             }
@@ -656,7 +638,7 @@ class VaillantECO305 extends IPSModuleStrict
             } elseif ($raw === 0x01) {
                 $logical[] = self::EBUS_SYN;
             } else {
-                $this->AbortPowerRead('Ungültige Escape-Sequenz in HMU-Antwort');
+                $this->AbortPowerRead('Ungültige Escape-Sequenz in Reglerantwort');
                 return;
             }
             $state['responseEscape'] = false;
@@ -665,7 +647,7 @@ class VaillantECO305 extends IPSModuleStrict
             $this->WritePowerState($state);
             return;
         } elseif ($raw === self::EBUS_SYN) {
-            $this->AbortPowerRead('HMU-Antwort vorzeitig beendet');
+            $this->AbortPowerRead('Reglerantwort vorzeitig beendet');
             return;
         } else {
             $logical[] = $raw;
@@ -674,7 +656,7 @@ class VaillantECO305 extends IPSModuleStrict
         if (count($logical) === 1) {
             $payloadLength = (int) $logical[0];
             if ($payloadLength < 4 || $payloadLength > 32) {
-                $this->AbortPowerRead('Unplausible HMU-Antwortlänge');
+                $this->AbortPowerRead('Unplausible Reglerantwortlänge');
                 return;
             }
             $state['responseExpected'] = 1 + $payloadLength;
@@ -698,7 +680,7 @@ class VaillantECO305 extends IPSModuleStrict
             ))));
             $this->SetValue('PowerReadStatus', $definition['label'] . ' erfolgreich gelesen');
         } elseif (!$valid) {
-            $this->SetValue('PowerReadStatus', 'HMU-Antwort mit ungültiger Prüfsumme');
+            $this->SetValue('PowerReadStatus', 'Reglerantwort mit ungültiger Prüfsumme');
         }
 
         $this->SetBuffer('PowerReadState', '');
@@ -709,7 +691,7 @@ class VaillantECO305 extends IPSModuleStrict
     {
         $payloadOffset = (int) ($definition['payloadOffset'] ?? 4);
         if (count($logical) <= $payloadOffset) {
-            $this->SetValue('PowerReadStatus', 'HMU-Antwort enthält keinen Messwert');
+            $this->SetValue('PowerReadStatus', 'Reglerantwort enthält keinen Messwert');
             return false;
         }
 
@@ -719,7 +701,7 @@ class VaillantECO305 extends IPSModuleStrict
         $decoder = (string) $definition['decoder'];
         $minimumBytes = $decoder === 'exp' ? 4 : 2;
         if (count($payload) < $minimumBytes) {
-            $this->SetValue('PowerReadStatus', 'HMU-Antwort ist zu kurz');
+            $this->SetValue('PowerReadStatus', 'Reglerantwort ist zu kurz');
             return false;
         }
 
@@ -792,11 +774,11 @@ class VaillantECO305 extends IPSModuleStrict
         $this->SetValue('PowerReadStatus', $message);
         $this->SetBuffer('PowerReadState', '');
 
-        if ($wasActive) {
-            // Release an arbitration still in progress, or end a transaction
-            // already won. This is the only non-read payload used here and is
-            // the mandatory eBUS synchronisation symbol, not a device command.
-            $this->SendEnhanced($stage === 'wait_start' ? 0x02 : 0x01, self::EBUS_SYN);
+        if ($wasActive && $stage !== 'wait_start') {
+            // End a transaction that was already won. SYN is the mandatory
+            // eBUS synchronisation symbol, not a device command. If
+            // arbitration never started, no second start attempt is made.
+            $this->SendEnhanced(0x01, self::EBUS_SYN);
         }
     }
 
