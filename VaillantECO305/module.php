@@ -29,6 +29,7 @@ class VaillantECO305 extends IPSModuleStrict
     private const EBUS_ACK = 0x00;
     private const EBUS_NAK = 0xFF;
     private const OWN_MASTER = 0x31;
+    private const PROBE_MASTER = 0xFF;
     private const HMU_ADDRESS = 0x08;
     private const CONTROLLER_ADDRESS = 0x15;
 
@@ -113,19 +114,18 @@ class VaillantECO305 extends IPSModuleStrict
     public function ApplyChanges(): void
     {
         parent::ApplyChanges();
-        // Safety lock for build 20: address 31 was already observed on this
-        // installation. Do not originate any telegram until occupied source
-        // addresses have been established passively.
+        // Build 22 keeps all device reads disabled. Only the explicit,
+        // arbitration-only FF probe in the configuration form is available.
         $this->SetTimerInterval('PowerPoll', 0);
-        $this->SetSummary('ECO305 Enhanced - passive Adressdiagnose - V1.4');
+        $this->SetSummary('ECO305 Enhanced - Adresstest FF ohne Geräteabfrage - V1.4');
 
         $this->SetBuffer('PowerReadState', '');
         $this->SetBuffer('EnhancedRxPartial', '');
         $this->SetBuffer('PassiveFrame', '');
         $this->SetBuffer('PassiveEscape', '0');
         $this->SetBuffer('PassiveSynchronized', '0');
-        // Build 21 applies stricter address and CRC validation. Discard the
-        // unvalidated Build-20 observations once when this build is applied.
+        // Keep the strict address and CRC validation introduced with build 21.
+        // Start a fresh observation window whenever this build is applied.
         $this->WriteAttributeString('DiagObservedSourcesJSON', '{}');
         $this->SetValue('DiagObservedSources', 'Warte auf vollständig empfangene Telegramme mit gültiger CRC');
         // The ECO305 connection is already delivering enhanced telegrams.
@@ -146,7 +146,7 @@ class VaillantECO305 extends IPSModuleStrict
             }
         }
 
-        $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – nur passive Adressdiagnose');
+        $this->SetValue('PowerReadStatus', 'Geräteabfragen gesperrt – nur Arbitrierungstest FF verfügbar');
         $this->EnableArchiveLogging();
     }
 
@@ -156,14 +156,20 @@ class VaillantECO305 extends IPSModuleStrict
             'elements' => [
                 [
                     'type'    => 'Label',
-                    'caption' => 'Build 21 arbeitet ausschließlich passiv. Aktive Leseabfragen sind wegen einer möglichen Kollision der eBUS-Adresse 31 vorübergehend gesperrt.'
+                    'caption' => 'Build 22 sperrt weiterhin alle Geräteabfragen. Der optionale Test prüft ausschließlich die Arbitrierung mit Masteradresse FF und gibt den Bus sofort wieder frei.'
                 ],
                 [
                     'type'    => 'Label',
                     'caption' => 'Unter den Statusvariablen zeigt „Diagnose: Passiv beobachtete eBUS-Absender“ alle vollständig empfangenen Absender mit Anzahl und Zeitstempel.'
                 ]
             ],
-            'actions' => []
+            'actions' => [
+                [
+                    'type'    => 'Button',
+                    'caption' => 'Buszugriff mit FF einmal prüfen (keine Geräteabfrage)',
+                    'onClick' => 'VECO_ProbeMasterAddress($id);'
+                ]
+            ]
         ], JSON_THROW_ON_ERROR);
     }
 
@@ -269,7 +275,7 @@ class VaillantECO305 extends IPSModuleStrict
         if ($command === self::ENH_RES_RESETTED) {
             $this->SetBuffer('PowerReadState', '');
             $this->SetBuffer('EnhancedInitialized', '1');
-            $this->SetValue('PowerReadStatus', 'ECO305 initialisiert – passive Sicherheitssperre bleibt aktiv');
+            $this->SetValue('PowerReadStatus', 'ECO305 initialisiert – Geräteabfragen bleiben gesperrt');
             return;
         }
 
@@ -336,16 +342,53 @@ class VaillantECO305 extends IPSModuleStrict
         $this->SetBuffer('PassiveFrame', $frameHex);
     }
 
-    /** Build 21 safety lock: do not start an active HMU request. */
+    /** Build 22 safety lock: do not start an active HMU request. */
     public function PollPower(): void
     {
         $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – aktive Abfrage nicht gesendet');
     }
 
-    /** Build 21 safety lock: do not start an active heating-curve request. */
+    /** Build 22 safety lock: do not start an active heating-curve request. */
     public function PollHeatingCurve(): void
     {
         $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – Heizkurvenabfrage nicht gesendet');
+    }
+
+    /**
+     * Perform one arbitration-only test with FF and release the bus
+     * immediately. No destination, command, payload, or device request is
+     * transmitted by this operation.
+     */
+    public function ProbeMasterAddress(): void
+    {
+        $state = $this->ReadPowerState();
+        if (($state['active'] ?? false) === true) {
+            $this->SetValue('PowerReadStatus', 'Anderer Protokollvorgang läuft – kein Test gesendet');
+            return;
+        }
+
+        $state = [
+            'active'           => true,
+            'mode'             => 'address_probe',
+            'key'              => 'address_probe',
+            'stage'            => 'wait_start',
+            'started'          => time(),
+            'txWire'           => [],
+            'txPos'            => 0,
+            'lastSent'         => -1,
+            'responseLogical'  => [],
+            'responseExpected' => 0,
+            'responseCrc'      => 0,
+            'responseEscape'   => false,
+            'responseCrcBytes' => [],
+            'responseValid'    => false
+        ];
+        $this->WritePowerState($state);
+        $this->SetValue('PowerReadTrace', '');
+        $this->SetValue('PowerReadLastRequest', 'Nur Arbitrierung FF; anschließend sofort SYN AA; keine Geräteadresse und keine Nutzdaten');
+        $this->SetValue('PowerReadStatus', 'Arbitrierungstest FF gestartet – keine Geräteabfrage');
+        $this->TracePowerRead('START address_probe | Master FF | danach ausschließlich SYN AA');
+        $this->SendEnhanced(0x02, self::PROBE_MASTER);
     }
 
     /** @param array<string, mixed>|null $forcedDefinition */
@@ -436,12 +479,26 @@ class VaillantECO305 extends IPSModuleStrict
 
         if ($command === self::ENH_RES_FAILED) {
             $this->TracePowerReadState('ECO305 BUSZUGRIFF BELEGT', $state, $command, $value);
+            if (($state['mode'] ?? '') === 'address_probe') {
+                $this->SetValue('PowerReadStatus', 'Arbitrierung FF nicht gewonnen – keine Geräteabfrage gesendet');
+                $this->SetBuffer('PowerReadState', '');
+                return;
+            }
             $this->AbortPowerRead('Buszugriff belegt – nächster Versuch folgt');
             return;
         }
         if ($command === self::ENH_RES_ERROR_EBUS || $command === self::ENH_RES_ERROR_HOST) {
             $errorName = $command === self::ENH_RES_ERROR_HOST ? 'ERROR_HOST' : 'ERROR_EBUS';
             $this->TracePowerReadState('ECO305 ' . $errorName, $state, $command, $value);
+            if (($state['mode'] ?? '') === 'address_probe') {
+                $this->SetValue('PowerReadStatus', sprintf(
+                    'Arbitrierungstest FF abgebrochen | %s %02X | keine Geräteabfrage gesendet',
+                    $errorName,
+                    $value
+                ));
+                $this->SetBuffer('PowerReadState', '');
+                return;
+            }
             $this->AbortPowerRead(sprintf(
                 'ECO305 Kommunikationsfehler %02X | %s | Stufe %s | Sendeposition %d/%d',
                 $value,
@@ -455,10 +512,19 @@ class VaillantECO305 extends IPSModuleStrict
 
         $stage = (string) ($state['stage'] ?? '');
         if ($stage === 'wait_start') {
-            if ($command !== self::ENH_RES_STARTED || $value !== self::OWN_MASTER) {
+            $isAddressProbe = ($state['mode'] ?? '') === 'address_probe';
+            $expectedMaster = $isAddressProbe ? self::PROBE_MASTER : self::OWN_MASTER;
+            if ($command !== self::ENH_RES_STARTED || $value !== $expectedMaster) {
                 return;
             }
             $this->TracePowerRead('ARBITRIERUNG ERFOLGREICH | Master ' . sprintf('%02X', $value));
+            if ($isAddressProbe) {
+                $state['stage'] = 'send_probe_syn';
+                $state['lastSent'] = self::EBUS_SYN;
+                $this->WritePowerState($state);
+                $this->SendEnhanced(0x01, self::EBUS_SYN);
+                return;
+            }
             $state['stage'] = 'send_master';
             $this->SendNextPowerByte($state);
             return;
@@ -480,6 +546,19 @@ class VaillantECO305 extends IPSModuleStrict
             }
             $state['stage'] = 'wait_command_ack';
             $this->WritePowerState($state);
+            return;
+        }
+
+        if ($stage === 'send_probe_syn') {
+            if ($value !== self::EBUS_SYN) {
+                $this->TracePowerReadState('UNERWARTETES ECHO BEIM FREIGEBEN', $state, $command, $value);
+                $this->SetValue('PowerReadStatus', 'Arbitrierung gewonnen, Busfreigabe nicht bestätigt – keine Geräteabfrage gesendet');
+                $this->SetBuffer('PowerReadState', '');
+                return;
+            }
+            $this->TracePowerRead('BUS SOFORT FREIGEGEBEN | SYN AA bestätigt | keine Geräteabfrage gesendet');
+            $this->SetValue('PowerReadStatus', 'Arbitrierung FF erfolgreich; Bus sofort freigegeben; keine Geräteabfrage gesendet');
+            $this->SetBuffer('PowerReadState', '');
             return;
         }
 
