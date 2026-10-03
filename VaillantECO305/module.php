@@ -7,7 +7,7 @@ declare(strict_types=1);
  *
  * SAFETY DESIGN:
  * - Passive decoding remains enabled for all existing values.
- * - Build 27 centrally blocks every active eBUS transmission.
+ * - Build 28 centrally blocks every active eBUS transmission.
  * - No EnableTest messages.
  * - No compressor, pump, valve, service or safety commands.
  * - No caller-controlled raw messages and no configuration action buttons.
@@ -113,30 +113,39 @@ class VaillantECO305 extends IPSModuleStrict
         // source addresses before any further active request is considered.
         $this->RegisterVariableString('DiagObservedSources', 'Diagnose: Passiv beobachtete eBUS-Absender', '', 1080);
         $this->RegisterAttributeString('DiagObservedSourcesJSON', '{}');
+
+        // Correlated passive snapshots. Values are published only when a
+        // B5-24 candidate is encountered, not for every received symbol.
+        $this->RegisterVariableString('DiagEnhancedRawSnapshot', 'Diagnose: ECO305 Rohdaten bei B5-24', '', 1090);
+        $this->RegisterVariableString('DiagEnhancedEventSnapshot', 'Diagnose: ECO305 Ereignisse bei B5-24', '', 1100);
+        $this->RegisterVariableString('DiagPassiveFrameSnapshot', 'Diagnose: Passiver Rahmen bei B5-24', '', 1110);
     }
 
     public function ApplyChanges(): void
     {
         parent::ApplyChanges();
-        // Build 27 is strictly passive. Timers, manual actions and the final
+        // Build 28 is strictly passive. Timers, manual actions and the final
         // socket send path are all locked against active eBUS traffic. B5-24
         // decoding additionally requires a fully CRC-valid transaction.
         $this->SetTimerInterval('PowerPoll', 0);
-        $this->SetSummary('ECO305 Enhanced - passiv, B5-24 Prüfdialog - V1.4');
+        $this->SetSummary('ECO305 Enhanced - passiv, B5-24 Transportdiagnose - V1.4');
 
         $this->SetBuffer('PowerReadState', '');
         $this->SetBuffer('EnhancedRxPartial', '');
         $this->SetBuffer('PassiveFrame', '');
         $this->SetBuffer('PassiveEscape', '0');
         $this->SetBuffer('PassiveSynchronized', '0');
+        $this->SetBuffer('EnhancedRawRollingHex', '');
+        $this->SetBuffer('EnhancedEventRolling', '');
+        $this->SetBuffer('LastTransportSnapshotTime', '0');
         // Keep the strict address and CRC validation introduced with build 21.
         // Start a fresh observation window whenever this build is applied.
         $this->WriteAttributeString('DiagObservedSourcesJSON', '{}');
         $this->SetValue('DiagObservedSources', 'Warte auf vollständig empfangene Telegramme mit gültiger CRC');
         // Build 25 admitted incomplete B5-24 fragments. Reset those legacy
-        // diagnostics exactly once when upgrading to the strict Build-27
+        // diagnostics exactly once when upgrading to the strict Build-28
         // validation schema; ordinary reconnects must retain clean captures.
-        if ($this->ReadAttributeInteger('B524ValidationSchema') < 27) {
+        if ($this->ReadAttributeInteger('B524ValidationSchema') < 28) {
             $this->WriteAttributeString('DiagB524TypesJSON', '{}');
             $this->WriteAttributeString('DiagB524ChangesJSON', '{}');
             $this->WriteAttributeString('DiagB524RejectReasonsJSON', '{}');
@@ -148,7 +157,10 @@ class VaillantECO305 extends IPSModuleStrict
             $this->SetValue('DiagLastRejectedB524', 'Noch kein B5-24-Kandidat abgelehnt');
             $this->SetValue('DiagB524ChangeCount', 0);
             $this->SetValue('DiagB524Changes', 'Noch keine CRC-validierte B5-24-Nutzdatenänderung');
-            $this->WriteAttributeInteger('B524ValidationSchema', 27);
+            $this->SetValue('DiagEnhancedRawSnapshot', 'Warte auf B5-24-Kandidaten');
+            $this->SetValue('DiagEnhancedEventSnapshot', 'Warte auf B5-24-Kandidaten');
+            $this->SetValue('DiagPassiveFrameSnapshot', 'Warte auf B5-24-Kandidaten');
+            $this->WriteAttributeInteger('B524ValidationSchema', 28);
         }
         // The ECO305 connection is already delivering enhanced telegrams.
         // Some ECO305 firmware does not answer a repeated INIT on an existing
@@ -164,7 +176,7 @@ class VaillantECO305 extends IPSModuleStrict
             }
         }
 
-        $this->SetValue('PowerReadStatus', 'Build 27 passiv – aktive Abfragen gesperrt; B5-24 Ablehnungsdiagnose aktiv');
+        $this->SetValue('PowerReadStatus', 'Build 28 passiv – aktive Abfragen gesperrt; B5-24 Transportdiagnose aktiv');
         $this->EnableArchiveLogging();
     }
 
@@ -174,7 +186,7 @@ class VaillantECO305 extends IPSModuleStrict
             'elements' => [
                 [
                     'type'    => 'Label',
-                    'caption' => 'Build 27 arbeitet ausschließlich passiv. B5-24-Kandidaten werden geprüft und Ablehnungsgründe protokolliert; nur vollständig CRC-validierte Transaktionen dürfen ausgewertet werden. Es gibt keine Geräteabfrage, keine Arbitrierung, keine Wiederholung und kein Schreibtelegramm.'
+                    'caption' => 'Build 28 arbeitet ausschließlich passiv. Bei B5-24-Kandidaten werden ECO305-Rohdaten, dekodierte Enhanced-Ereignisse und der gebildete passive Rahmen gemeinsam festgehalten. Nur vollständig CRC-validierte Transaktionen dürfen ausgewertet werden. Es gibt keine Geräteabfrage, keine Arbitrierung, keine Wiederholung und kein Schreibtelegramm.'
                 ],
                 [
                     'type'    => 'Label',
@@ -241,6 +253,7 @@ class VaillantECO305 extends IPSModuleStrict
         $data = $partial . $incoming;
         $length = strlen($data);
         $position = 0;
+        $events = [];
 
         while ($position < $length) {
             $first = ord($data[$position]);
@@ -249,7 +262,12 @@ class VaillantECO305 extends IPSModuleStrict
             // normally received eBUS symbol.
             if (($first & 0x80) === 0) {
                 $position++;
-                $this->HandleEnhancedEvent(self::ENH_RES_RECEIVED, $first);
+                $events[] = [
+                    'command' => self::ENH_RES_RECEIVED,
+                    'value' => $first,
+                    'wire' => sprintf('%02X', $first),
+                    'kind' => 'plain'
+                ];
                 continue;
             }
 
@@ -273,13 +291,64 @@ class VaillantECO305 extends IPSModuleStrict
             $command = ($first >> 2) & 0x0F;
             $value = (($first & 0x03) << 6) | ($second & 0x3F);
             $position += 2;
-            $this->HandleEnhancedEvent($command, $value);
+            $events[] = [
+                'command' => $command,
+                'value' => $value,
+                'wire' => sprintf('%02X %02X', $first, $second),
+                'kind' => 'pair'
+            ];
         }
 
         $rest = substr($data, $position);
         $this->SetBuffer('EnhancedRxPartial', bin2hex($rest));
+        $this->AppendEnhancedTransportDiagnostic($incoming, $events);
+
+        foreach ($events as $event) {
+            $this->HandleEnhancedEvent((int) $event['command'], (int) $event['value']);
+        }
 
         return '';
+    }
+
+    /**
+     * Retain a small rolling window of the untouched TCP bytes and their
+     * decoded ECO305 Enhanced events. Publication occurs only when B5-24 is
+     * encountered, so this passive diagnostic does not create a value update
+     * for every bus symbol.
+     *
+     * @param array<int, array<string, int|string>> $events
+     */
+    private function AppendEnhancedTransportDiagnostic(string $incoming, array $events): void
+    {
+        $rawHex = $this->GetBuffer('EnhancedRawRollingHex') . strtoupper(bin2hex($incoming));
+        if (strlen($rawHex) > 2048) {
+            $rawHex = substr($rawHex, -2048);
+        }
+        $this->SetBuffer('EnhancedRawRollingHex', $rawHex);
+
+        $lines = [];
+        $stamp = date('H:i:s');
+        foreach ($events as $event) {
+            $lines[] = sprintf(
+                '%s | %s | Wire %s | Kommando %02X | Wert %02X',
+                $stamp,
+                (string) ($event['kind'] ?? '?'),
+                (string) ($event['wire'] ?? ''),
+                (int) ($event['command'] ?? 0),
+                (int) ($event['value'] ?? 0)
+            );
+        }
+
+        if ($lines === []) {
+            return;
+        }
+        $existing = $this->GetBuffer('EnhancedEventRolling');
+        $allLines = $existing === '' ? [] : explode("\n", $existing);
+        $allLines = array_merge($allLines, $lines);
+        if (count($allLines) > 160) {
+            $allLines = array_slice($allLines, -160);
+        }
+        $this->SetBuffer('EnhancedEventRolling', implode("\n", $allLines));
     }
 
     private function HandleEnhancedEvent(int $command, int $value): void
@@ -287,7 +356,7 @@ class VaillantECO305 extends IPSModuleStrict
         if ($command === self::ENH_RES_RESETTED) {
             $this->SetBuffer('PowerReadState', '');
             $this->SetBuffer('EnhancedInitialized', '1');
-            $this->SetValue('PowerReadStatus', 'ECO305 initialisiert – Build 27 bleibt vollständig passiv');
+            $this->SetValue('PowerReadStatus', 'ECO305 initialisiert – Build 28 bleibt vollständig passiv');
             return;
         }
 
@@ -354,16 +423,16 @@ class VaillantECO305 extends IPSModuleStrict
         $this->SetBuffer('PassiveFrame', $frameHex);
     }
 
-    /** Build 27 safety lock: active HMU requests are unavailable. */
+    /** Build 28 safety lock: active HMU requests are unavailable. */
     public function PollPower(): void
     {
         $this->SetValue('PowerReadStatus', 'Sicherheitssperre aktiv – aktive Abfrage nicht gesendet');
     }
 
-    /** Build 27 safety lock: active heating-curve reads are unavailable. */
+    /** Build 28 safety lock: active heating-curve reads are unavailable. */
     public function PollHeatingCurve(): void
     {
-        $this->SetValue('PowerReadStatus', 'Build 27 passiv – Heizkurvenabfrage nicht gesendet');
+        $this->SetValue('PowerReadStatus', 'Build 28 passiv – Heizkurvenabfrage nicht gesendet');
     }
 
     /**
@@ -373,7 +442,7 @@ class VaillantECO305 extends IPSModuleStrict
      */
     public function ProbeMasterAddress(): void
     {
-        $this->SetValue('PowerReadStatus', 'Build 27 passiv – Arbitrierungstest nicht gesendet');
+        $this->SetValue('PowerReadStatus', 'Build 28 passiv – Arbitrierungstest nicht gesendet');
     }
 
     private function StartHeatingCurveRead(): void
@@ -901,7 +970,7 @@ class VaillantECO305 extends IPSModuleStrict
     private function SendEnhanced(int $command, int $value): void
     {
         if (!self::ACTIVE_TRAFFIC_ALLOWED) {
-            $this->SetValue('PowerReadStatus', 'Build 27 passiv – zentrale Sendesperre aktiv');
+            $this->SetValue('PowerReadStatus', 'Build 28 passiv – zentrale Sendesperre aktiv');
             $this->SetBuffer('PowerReadState', '');
             return;
         }
@@ -939,6 +1008,7 @@ class VaillantECO305 extends IPSModuleStrict
             } elseif (($telegram[$p + 1] ?? -1) === 0x12) {
                 $this->ProcessB512($telegram, $p);
             } elseif (($telegram[$p + 1] ?? -1) === 0x24) {
+                $this->PublishB524TransportSnapshot($telegram, $p);
                 $this->IncrementDiagnostic('DiagB524CandidateCount');
                 $validation = $this->ValidateB524Transaction($telegram, $p);
                 if (($validation['code'] ?? '') !== 'OK') {
@@ -1117,6 +1187,44 @@ class VaillantECO305 extends IPSModuleStrict
                 $protocolPosition,
                 $this->BytesToHex($frame),
                 $suffix
+            )
+        );
+    }
+
+    /**
+     * Publish correlated transport layers at most once every five seconds.
+     * The rolling buffers themselves are updated continuously but locally.
+     *
+     * @param array<int, int> $telegram
+     */
+    private function PublishB524TransportSnapshot(array $telegram, int $protocolPosition): void
+    {
+        $now = time();
+        $last = (int) $this->GetBuffer('LastTransportSnapshotTime');
+        if ($last > 0 && ($now - $last) < 5) {
+            return;
+        }
+        $this->SetBuffer('LastTransportSnapshotTime', (string) $now);
+
+        $rawHex = $this->GetBuffer('EnhancedRawRollingHex');
+        $spacedRaw = $rawHex === ''
+            ? ''
+            : trim((string) preg_replace('/(..)(?!$)/', '$1 ', strtoupper($rawHex)));
+        $this->SetValue(
+            'DiagEnhancedRawSnapshot',
+            date('d.m.Y H:i:s', $now) . ' | letzte ' . (int) (strlen($rawHex) / 2) . ' TCP-Bytes | ' . $spacedRaw
+        );
+        $this->SetValue(
+            'DiagEnhancedEventSnapshot',
+            date('d.m.Y H:i:s', $now) . " | dekodierte Ereignisse\n" . $this->GetBuffer('EnhancedEventRolling')
+        );
+        $this->SetValue(
+            'DiagPassiveFrameSnapshot',
+            sprintf(
+                '%s | B5-24-Position %d | %s',
+                date('d.m.Y H:i:s', $now),
+                $protocolPosition,
+                $this->BytesToHex(array_slice($telegram, 0, 256)) . (count($telegram) > 256 ? ' ... [gekürzt]' : '')
             )
         );
     }
